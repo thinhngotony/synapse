@@ -1,0 +1,208 @@
+name: Release
+
+# Tag push publishes; workflow_dispatch builds and checksums everything without
+# touching the release, so the packaging path can be exercised before tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Least privilege by default; only the release job is granted write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Version gate ───────────────────────────────────────────────────────────
+  #
+  # Runs before the 4 builds so a mistyped tag costs seconds, not a full matrix.
+  # A tag that disagrees with Cargo.toml would publish synapse-<tag>-<target>
+  # assets under a version the installer resolves but cannot match, so this is
+  # a hard failure rather than a warning.
+  version:
+    name: version gate
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve and verify version
+        id: v
+        run: |
+          set -euo pipefail
+          # First `version =` in Cargo.toml is [package]'s; dependencies follow.
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "Cargo.toml version: $cargo_version"
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            echo "tag: $GITHUB_REF_NAME (version $tag_version)"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME implies version $tag_version but Cargo.toml says $cargo_version; bump Cargo.toml or retag"
+              exit 1
+            fi
+          else
+            echo "dry run: no tag, using Cargo.toml version"
+          fi
+
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  # ── Per-target build ───────────────────────────────────────────────────────
+  #
+  # Every target has a native runner, so there is no cross toolchain, no linker
+  # config, and no --target flag: the host triple *is* the asset triple. The
+  # host assertion below keeps that assumption honest if a runner image changes.
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: runner host triple matches the asset triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host: $host"
+          [ "$host" = "${{ matrix.target }}" ] \
+            || { echo "::error::runner ${{ matrix.os }} is $host, not ${{ matrix.target }}"; exit 1; }
+
+      - name: cargo build
+        run: cargo build --release --locked
+
+      - name: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # -x keeps the strip portable across GNU binutils and cctools.
+          strip -x target/release/synapse
+          tarball="synapse-${VERSION}-${TARGET}.tar.gz"
+          # -C means the archive holds exactly one member, `synapse`, at root.
+          tar -czf "$tarball" -C target/release synapse
+          tar -tzf "$tarball"
+          ls -lh "$tarball"
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARBALL }}
+          path: ${{ env.TARBALL }}
+          if-no-files-found: error
+
+  # ── Collect, checksum, publish ─────────────────────────────────────────────
+  release:
+    name: publish release
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # merge-multiple flattens all 4 artifacts into dist/ with no per-artifact
+      # subdirectories, which is what keeps checksums.txt filenames bare.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -1
+          # Run from inside dist/ with a bare glob so sha256sum records bare
+          # filenames; the installer matches on the `-<target>.tar.gz` suffix.
+          sha256sum synapse-*.tar.gz > checksums.txt
+          cat checksums.txt
+          count="$(wc -l < checksums.txt | tr -d ' ')"
+          [ "$count" = 4 ] || { echo "::error::expected 4 tarballs, found $count"; exit 1; }
+          sha256sum -c checksums.txt
+
+      # Package versions come from the flake rather than being hardcoded here:
+      # herdr tracks nixpkgs, so a literal in this file would silently rot.
+      - uses: cachix/install-nix-action@v27
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.24.10/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          herdr="$(nix eval --raw '.#herdr.version')"
+          omp="$(nix eval --raw '.#omp.version')"
+          skillshare="$(nix eval --raw '.#skillshare.version')"
+
+          {
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo 'curl -sfS https://synapse.hyberorbit.com/install | sh'
+            echo '```'
+            echo
+            echo "## Managed packages"
+            echo
+            echo "| Package | Version |"
+            echo "| --- | --- |"
+            echo "| herdr | $herdr |"
+            echo "| omp | $omp |"
+            echo "| skillshare | $skillshare |"
+            echo
+            echo "## Changelog"
+            echo
+          } > notes.md
+
+          if [ -f CHANGELOG.md ]; then
+            # Capture everything under `## [<version>]` up to the next `## [`.
+            section="$(awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)"
+          else
+            section=""
+          fi
+
+          if [ -n "$(printf '%s' "$section" | tr -d '[:space:]')" ]; then
+            printf '%s\n' "$section" >> notes.md
+          else
+            echo "No changelog entry found for ${VERSION}." >> notes.md
+          fi
+
+          cat notes.md
+
+      - name: publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: synapse ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          files: |
+            dist/synapse-*.tar.gz
+            dist/checksums.txt
+          fail_on_unmatched_files: true
