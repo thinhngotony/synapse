@@ -156,9 +156,9 @@ pub fn draw(f: &mut Frame, state: &mut InstallerState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // header
-            Constraint::Min(0),    // main
-            Constraint::Length(3), // footer
+            Constraint::Length(HEADER_ROWS),
+            Constraint::Min(0), // content
+            Constraint::Length(FOOTER_ROWS),
         ])
         .split(f.area());
 
@@ -414,6 +414,15 @@ pub fn doctor_check(binaries: &[&str]) -> Vec<(String, bool)> {
 /// leaves no room for content and ratatui panics on the zero-height area.
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 12;
+
+/// Rows consumed by the fixed header and footer blocks in [`draw`].
+const HEADER_ROWS: u16 = 4;
+const FOOTER_ROWS: u16 = 3;
+
+// Compile-time: the minimum must leave at least one row for content. Editing any
+// of these constants into an inconsistent state fails the build rather than
+// panicking inside ratatui at runtime.
+const _: () = assert!(MIN_HEIGHT > HEADER_ROWS + FOOTER_ROWS);
 
 /// Run the interactive TUI installer.
 ///
@@ -730,19 +739,6 @@ mod tests {
         assert!(result[0].1, "`sh` should be found");
     }
 
-    /// The layout reserves fixed header and footer rows; the declared minimum
-    /// must actually leave room for content, or ratatui gets a zero-height area.
-    #[test]
-    fn min_height_leaves_room_for_content() {
-        const HEADER: u16 = 4;
-        const FOOTER: u16 = 3;
-        assert!(
-            MIN_HEIGHT > HEADER + FOOTER,
-            "MIN_HEIGHT {MIN_HEIGHT} leaves no rows for content \
-             (header {HEADER} + footer {FOOTER})"
-        );
-    }
-
     /// Rendering the full TUI at the declared minimum must not panic.
     ///
     /// TestBackend drives the real draw path with no terminal, so this covers the
@@ -762,7 +758,9 @@ mod tests {
         app.install_status[0] = InstallStatus::Running {
             started: Instant::now(),
         };
-        terminal.draw(|f| draw(f, &mut app)).expect("installing step");
+        terminal
+            .draw(|f| draw(f, &mut app))
+            .expect("installing step");
 
         app.step = Step::Done;
         app.install_status[0] = InstallStatus::Done;

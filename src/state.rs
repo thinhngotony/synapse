@@ -146,15 +146,78 @@ pub fn config_dir() -> PathBuf {
     dirs_from_env().join("synapse")
 }
 
+/// The current user's home directory.
+///
+/// Prefers `HOME`, then the passwd database. Returns `None` only when neither is
+/// available, so callers can report that rather than building a relative path
+/// like `Library/LaunchAgents` that resolves against whatever the CWD happens to
+/// be — under launchd, `/`.
+pub fn home_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    passwd_home()
+}
+
 /// Resolve `~/.config` from the environment. Respects `XDG_CONFIG_HOME`.
+///
+/// Falls back to the real passwd home when `HOME` is unset — some schedulers and
+/// `su`-style invocations drop it. Writing to `/tmp` instead would silently put
+/// installed-package state somewhere world-writable that vanishes on reboot, so
+/// the passwd database is consulted before giving up.
 fn dirs_from_env() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
-    PathBuf::from(home).join(".config")
+
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config");
+        }
+    }
+
+    if let Some(home) = passwd_home() {
+        return home.join(".config");
+    }
+
+    // Last resort. Reached only when HOME is unset *and* the passwd lookup fails,
+    // which in practice means a broken environment; a relative path keeps the
+    // failure local and visible rather than scattering state into /tmp.
+    PathBuf::from(".config")
+}
+
+/// The current user's home directory according to the passwd database.
+#[cfg(unix)]
+fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+
+    // SAFETY: getpwuid returns a pointer into a static buffer owned by libc, or
+    // null. We only read it, and copy the string out before returning, so the
+    // borrow does not outlive the call.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        let dir = (*pw).pw_dir;
+        if dir.is_null() {
+            return None;
+        }
+        let bytes = CStr::from_ptr(dir).to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
+    }
+}
+
+#[cfg(not(unix))]
+fn passwd_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
 // ── State I/O ─────────────────────────────────────────────────────────────────
@@ -390,6 +453,101 @@ mod tests {
         let d = tmpdir();
         let s = read(d.path()).unwrap();
         assert!(s.packages.is_empty());
+    }
+
+    /// State must never land in `/tmp` when `HOME` is unset.
+    ///
+    /// The old fallback was `/tmp/.config`, which is world-writable and cleared
+    /// on reboot — so a scheduler running without HOME would quietly write the
+    /// record of installed packages somewhere tamperable that would not survive
+    /// a restart.
+    #[test]
+    fn config_dir_never_falls_back_to_tmp() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+
+        let dir = config_dir();
+
+        if let Some(v) = prev_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", v);
+        }
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        }
+
+        assert!(
+            !dir.starts_with("/tmp"),
+            "state would be written under /tmp: {dir:?}"
+        );
+    }
+
+    /// With `HOME` unset, the passwd database should still yield a real home, so
+    /// paths built from it are absolute rather than relative to the CWD.
+    #[cfg(unix)]
+    #[test]
+    fn home_dir_falls_back_to_passwd() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+        let resolved = home_dir();
+        if let Some(v) = prev {
+            std::env::set_var("HOME", v);
+        }
+
+        let home = resolved.expect("passwd lookup should provide a home directory");
+        assert!(
+            home.is_absolute(),
+            "home must be absolute or scheduler paths resolve against PWD=/: {home:?}"
+        );
+    }
+
+    /// `HOME` takes precedence when set and non-empty.
+    #[test]
+    fn home_dir_prefers_the_environment() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/custom/home");
+        let resolved = home_dir();
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved, Some(PathBuf::from("/custom/home")));
+    }
+
+    /// An empty `HOME` must not produce a path rooted at the filesystem root.
+    #[test]
+    fn empty_home_is_not_treated_as_valid() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "");
+        let dir = config_dir();
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_ne!(
+            dir,
+            PathBuf::from("/.config/synapse"),
+            "empty HOME was treated as the filesystem root"
+        );
     }
 
     #[test]

@@ -296,6 +296,18 @@ jobs:
             || { echo "::error::status reported Nix $reported but nix --version says $actual"; exit 1; }
           echo "status agrees with nix --version: $reported"
 
+      # Standing gate for the scheduler-environment bug class.
+      #
+      # launchd/systemd/cron give a job a minimal environment: no XDG_*, and no
+      # Nix profile directory on PATH. A bug here passes every interactive test
+      # and then fails silently at 02:00 — which is exactly what happened when
+      # every nix invocation resolved via PATH. This runs the scheduler-invoked
+      # command paths under `env -i` from both the repo dir and PWD=/, and
+      # asserts up front that nix is genuinely absent from the minimal PATH so
+      # the check cannot pass vacuously.
+      - name: scheduler-environment command paths
+        run: ./ci/scheduler-env.sh ./target/release/synapse
+
       - name: fresh install
         run: ./ci/lifecycle.sh fresh-install
 

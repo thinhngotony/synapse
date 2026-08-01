@@ -170,18 +170,39 @@ const LAUNCHD_LABEL: &str = "com.synapse.auto-update";
 const SYSTEMD_UNIT: &str = "synapse-auto-update";
 const CRON_MARKER: &str = "# synapse-auto-update";
 
-fn launchd_plist_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
+/// Path to the LaunchAgent plist.
+///
+/// Errors rather than building a relative path: with `HOME` unset,
+/// `unwrap_or_default()` produced `Library/LaunchAgents/...`, which resolves
+/// against the CWD — `/` under launchd — so the write would land somewhere
+/// launchd never reads, or fail with a confusing permission error.
+fn launchd_plist_path() -> io::Result<PathBuf> {
+    let home = state::home_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot locate your home directory (HOME is unset and the passwd \
+             lookup failed), so the LaunchAgent path cannot be determined",
+        )
+    })?;
+    Ok(home
         .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"))
+        .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-fn systemd_unit_dir() -> PathBuf {
+/// Directory for systemd user units.
+///
+/// Derived from the config dir's parent so it honours `XDG_CONFIG_HOME`. Falling
+/// back to `/tmp` would write units systemd never loads while reporting success.
+fn systemd_unit_dir() -> io::Result<PathBuf> {
     state::config_dir()
         .parent()
         .map(|p| p.join("systemd/user"))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot determine the systemd user unit directory",
+            )
+        })
 }
 
 // ── Enable ────────────────────────────────────────────────────────────────────
@@ -212,7 +233,7 @@ fn enable_launchd(hour: u32, minute: u32) -> io::Result<()> {
     }
 
     let exe = synapse_exe_path();
-    let plist_path = launchd_plist_path();
+    let plist_path = launchd_plist_path()?;
     if let Some(p) = plist_path.parent() {
         fs::create_dir_all(p)?;
     }
@@ -281,7 +302,7 @@ fn disable_launchd() -> io::Result<()> {
         println!("auto-update already disabled");
         return Ok(());
     }
-    let plist_path = launchd_plist_path();
+    let plist_path = launchd_plist_path()?;
     let status = Command::new("launchctl")
         .args(["unload", "-w", plist_path.to_str().unwrap_or_default()])
         .status()
@@ -312,7 +333,7 @@ fn enable_systemd(hour: u32, minute: u32) -> io::Result<()> {
     }
 
     let exe = synapse_exe_path();
-    let dir = systemd_unit_dir();
+    let dir = systemd_unit_dir()?;
     fs::create_dir_all(&dir)?;
 
     let service = format!(
@@ -389,7 +410,7 @@ fn disable_systemd() -> io::Result<()> {
         "--now",
         &format!("{SYSTEMD_UNIT}.timer"),
     ])?;
-    let dir = systemd_unit_dir();
+    let dir = systemd_unit_dir()?;
     for name in [
         &format!("{SYSTEMD_UNIT}.timer"),
         &format!("{SYSTEMD_UNIT}.service"),

@@ -15,6 +15,11 @@ set -euo pipefail
 
 STAGE="${1:?usage: lifecycle.sh <fresh-install|update|rollback|uninstall>}"
 SYNAPSE="${SYNAPSE_BIN:-./target/release/synapse}"
+if [ ! -x "$SYNAPSE" ]; then
+    printf '::error::%s is not an executable file\n' "$SYNAPSE" >&2
+    printf '  build it first: cargo build --release\n' >&2
+    exit 1
+fi
 : "${XDG_CONFIG_HOME:?XDG_CONFIG_HOME must be set so stages share state}"
 
 STATE_FILE="$XDG_CONFIG_HOME/synapse/state.json"

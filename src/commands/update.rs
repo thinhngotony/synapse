@@ -173,16 +173,49 @@ pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str)
         .map(str::to_string)
 }
 
+/// Locate the directory containing `flake.nix`.
+///
+/// Order matters, and the CWD is deliberately *last*: launchd runs jobs with
+/// `PWD=/`, so a scheduled `auto-update now` that trusted the working directory
+/// would look for the flake in `/`, fail every package build, and report FAILED
+/// while the same command worked perfectly from an interactive shell.
+///
+/// Checked in order:
+/// 1. `SYNAPSE_FLAKE_DIR`, for an explicit override.
+/// 2. Next to the executable (installed layout).
+/// 3. Walking up from the executable, covering `target/release/synapse` in a
+///    dev checkout and `<prefix>/bin/synapse` beside a shared flake.
+/// 4. The current directory, last, for `cargo run` from the repo root.
 pub fn locate_flake_dir() -> std::path::PathBuf {
-    // Check exe dir first (installed layout: synapse binary next to flake).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if parent.join("flake.nix").exists() {
-                return parent.to_path_buf();
-            }
+    if let Some(dir) = std::env::var_os("SYNAPSE_FLAKE_DIR") {
+        let path = std::path::PathBuf::from(dir);
+        if path.join("flake.nix").is_file() {
+            return path;
         }
     }
-    // Fall back to cwd (dev layout).
+
+    if let Ok(exe) = std::env::current_exe() {
+        // Walk up from the binary; bounded so a deep path cannot spin.
+        let mut cursor = exe.parent();
+        for _ in 0..5 {
+            let Some(dir) = cursor else { break };
+            if dir.join("flake.nix").is_file() {
+                return dir.to_path_buf();
+            }
+            cursor = dir.parent();
+        }
+    }
+
+    // Only trust the CWD if it actually holds a flake, so a scheduled run from
+    // `/` does not silently proceed with a directory that cannot possibly work.
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("flake.nix").is_file() {
+            return cwd;
+        }
+    }
+
+    // Nothing found. Return the CWD so the caller's `nix build` fails with a
+    // real message rather than us inventing a path that does not exist.
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
@@ -195,5 +228,92 @@ mod tests {
         // Must always yield something a Command can be given as cwd.
         let p = locate_flake_dir();
         assert!(p.is_absolute() || p == std::path::Path::new("."));
+    }
+
+    /// The override must win, and must be honoured even when the CWD has no
+    /// flake — which is the situation a scheduled run is always in.
+    #[test]
+    fn flake_dir_override_is_honoured() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "synapse-flakedir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("flake.nix"), "{}").unwrap();
+
+        let prev = std::env::var_os("SYNAPSE_FLAKE_DIR");
+        std::env::set_var("SYNAPSE_FLAKE_DIR", &dir);
+        let found = locate_flake_dir();
+        match prev {
+            Some(v) => std::env::set_var("SYNAPSE_FLAKE_DIR", v),
+            None => std::env::remove_var("SYNAPSE_FLAKE_DIR"),
+        }
+
+        assert_eq!(found, dir, "override was ignored");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An override pointing somewhere without a flake must be ignored rather
+    /// than returned, so we never hand `nix build` a directory we know is wrong.
+    #[test]
+    fn flake_dir_override_without_a_flake_is_ignored() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let empty = std::env::temp_dir().join(format!(
+            "synapse-noflake-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let prev = std::env::var_os("SYNAPSE_FLAKE_DIR");
+        std::env::set_var("SYNAPSE_FLAKE_DIR", &empty);
+        let found = locate_flake_dir();
+        match prev {
+            Some(v) => std::env::set_var("SYNAPSE_FLAKE_DIR", v),
+            None => std::env::remove_var("SYNAPSE_FLAKE_DIR"),
+        }
+
+        assert_ne!(
+            found, empty,
+            "returned an override directory that contains no flake.nix"
+        );
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// In this checkout the binary lives at `target/{debug,release}/synapse`, so
+    /// walking up from the executable must find the repo's own flake without any
+    /// reliance on the current directory.
+    #[test]
+    fn locates_flake_by_walking_up_from_the_executable() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var_os("SYNAPSE_FLAKE_DIR");
+        std::env::remove_var("SYNAPSE_FLAKE_DIR");
+        let found = locate_flake_dir();
+        if let Some(v) = prev {
+            std::env::set_var("SYNAPSE_FLAKE_DIR", v);
+        }
+
+        assert!(
+            found.join("flake.nix").is_file(),
+            "resolved {found:?}, which has no flake.nix — a scheduled run from / \
+             would fail every package build"
+        );
     }
 }
