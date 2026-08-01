@@ -1,0 +1,5 @@
+name = "synapse"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+# Set CLOUDFLARE_ACCOUNT_ID env var or use:
+# wrangler deploy --account-id <id>

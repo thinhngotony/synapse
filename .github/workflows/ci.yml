@@ -1,0 +1,388 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A new push to the same PR supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Fast feedback: lint on one platform ────────────────────────────────────
+  lint:
+    name: clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --all-targets is required: plain `cargo clippy` skips test and bench
+      # targets, which lets test-only lint breaks accumulate unnoticed.
+      - name: clippy (all targets)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Every ci/ script must at least parse; a syntax error there otherwise only
+      # shows up on the platform leg that runs it, which may be much later.
+      - name: shell scripts parse
+        run: |
+          set -euo pipefail
+          for f in ci/*.sh; do
+            bash -n "$f" || { echo "::error::$f has a syntax error"; exit 1; }
+          done
+
+      # Runs here too, not just on the nix legs: this guards the duplicated
+      # version parser and needs no Nix installed to be meaningful.
+      - name: nix version parser self-test
+        run: ./ci/check-nix-version.sh --self-test
+
+  # ── Rust build + tests across every supported platform ────────────────────
+  test:
+    name: test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-intel-x86_64
+            os: macos-13
+            arch: x86_64
+          - name: macos-arm-aarch64
+            os: macos-14
+            arch: aarch64
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            arch: x86_64
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: cargo build
+        run: cargo build --release --locked
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      # Detection is compile-time (cfg!), so this asserts the binary was built
+      # for the architecture the runner actually is.
+      - name: verify platform detection matches runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(./target/release/synapse version)"
+          echo "$output"
+          echo "$output" | grep -q "${{ matrix.arch }}" \
+            || { echo "::error::expected arch ${{ matrix.arch }} in version output"; exit 1; }
+
+      # Every read-only command must work with no config and no network.
+      - name: offline commands smoke test
+        shell: bash
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/synapse-offline
+        run: ./ci/offline-commands.sh ./target/release/synapse
+
+  # ── Shell integration, per platform and per shell ──────────────────────────
+  shell-integration:
+    name: shell ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm
+            os: macos-14
+          - name: linux-x86_64
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shell-${{ matrix.name }}
+
+      - name: build
+        run: cargo build --release --locked
+
+      - name: install zsh and fish
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq zsh fish
+          else
+            # macOS runners ship zsh; fish comes from brew.
+            command -v fish >/dev/null || brew install fish
+          fi
+
+      # Proves the generated rc is valid syntax, actually sets PATH, loads
+      # completions, and is idempotent — SYN-5's acceptance criteria.
+      - name: bash integration
+        run: ./ci/shell-check.sh bash "${{ runner.temp }}/home-bash"
+
+      - name: zsh integration
+        run: ./ci/shell-check.sh zsh "${{ runner.temp }}/home-zsh"
+
+      - name: fish integration
+        run: ./ci/shell-check.sh fish "${{ runner.temp }}/home-fish"
+
+  # ── Nix flake: this is what closes the darwin verification gap ─────────────
+  #
+  # SYN-2's derivations were only ever realised in a nixos/nix container
+  # (aarch64-linux). The macOS legs below are the first real proof that the
+  # darwin hashes transcribed from upstream checksums.txt are correct, and that
+  # bun 1.3.14's darwin binaries and omp's darwin natives resolve.
+  nix-flake:
+    name: nix ${{ matrix.nix_system }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            nix_system: x86_64-darwin
+          - os: macos-14
+            nix_system: aarch64-darwin
+          - os: ubuntu-22.04
+            nix_system: x86_64-linux
+          - os: ubuntu-22.04-arm
+            nix_system: aarch64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          # Synapse requires 2.24+; pin a known-good release rather than latest.
+          install_url: https://releases.nixos.org/nix/nix-2.24.10/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # The shell parser duplicates src/nix.rs because this leg runs before the
+      # binary is built. The self-test pins both to the same version shapes so
+      # they cannot drift apart unnoticed.
+      - name: nix version parser self-test
+        run: ./ci/check-nix-version.sh --self-test
+
+      # Asserts the runner's Nix satisfies the same floor synapse enforces.
+      - name: nix version satisfies the 2.24+ floor
+        run: ./ci/check-nix-version.sh
+
+      - name: flake.lock is committed and current
+        run: |
+          set -euo pipefail
+          test -f flake.lock || { echo "::error::flake.lock is not committed"; exit 1; }
+          # Fails if the lock file would need to change to evaluate.
+          nix flake metadata --no-update-lock-file >/dev/null
+
+      - name: flake evaluates for this system
+        run: nix eval ".#packages.${{ matrix.nix_system }}" --apply builtins.attrNames
+
+      # Built separately so a failure names the culprit package.
+      - name: build herdr
+        run: nix build ".#herdr" -L --no-link --print-out-paths
+
+      - name: build skillshare
+        run: nix build ".#skillshare" -L --no-link --print-out-paths
+
+      - name: build omp
+        run: nix build ".#omp" -L --no-link --print-out-paths
+
+      - name: build synapse
+        run: nix build ".#synapse" -L --no-link --print-out-paths
+
+      # Building is not enough: the binaries must actually run here.
+      - name: installed binaries respond on this platform
+        run: |
+          set -euo pipefail
+          nix build ".#harness" -L -o result-harness
+          for bin in herdr skillshare omp; do
+            echo "--- $bin"
+            ./result-harness/bin/"$bin" --version
+          done
+
+      - name: parallel build via nix-fast-build
+        run: |
+          set -euo pipefail
+          # Everything is already in the local store, so this exercises the
+          # parallel driver rather than rebuilding from scratch.
+          nix run nixpkgs#nix-fast-build -- \
+            --flake ".#packages.${{ matrix.nix_system }}" \
+            --no-nom \
+            --skip-cached
+
+  # ── Install / update / rollback / uninstall lifecycle ──────────────────────
+  lifecycle:
+    name: lifecycle ${{ matrix.nix_system }}
+    runs-on: ${{ matrix.os }}
+    needs: nix-flake
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            nix_system: aarch64-darwin
+          - os: ubuntu-22.04
+            nix_system: x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lifecycle-${{ matrix.nix_system }}
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.24.10/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: build synapse
+        run: cargo build --release --locked
+
+      # Manual QA item 4: Nix already present before Synapse runs.
+      #
+      # install-nix-action above installed Nix in an earlier step, so by the time
+      # synapse executes here Nix genuinely pre-dates it. This covers the branch
+      # where `nix::detect()` returns Supported and the installer must NOT try to
+      # install Nix — otherwise no job ever exercises it.
+      - name: synapse against pre-existing Nix
+        shell: bash
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/preexisting-nix
+        run: |
+          set -euo pipefail
+
+          # Prove Nix predates this step.
+          nix --version
+
+          # doctor must recognise it, not report "nix not found".
+          doctor_out="$(./target/release/synapse doctor 2>&1 || true)"
+          printf '%s\n' "$doctor_out"
+          printf '%s' "$doctor_out" | grep -qE '✓[[:space:]]+nix' \
+            || { echo "::error::doctor did not detect the pre-existing Nix"; exit 1; }
+          printf '%s' "$doctor_out" | grep -q 'nix not found' \
+            && { echo "::error::doctor reported Nix missing when it is installed"; exit 1; }
+
+          # status must report a version, and it must be the Nix version — not a
+          # distribution's product version (the Determinate wrapper case).
+          status_out="$(./target/release/synapse status 2>&1 || true)"
+          printf '%s\n' "$status_out"
+          nix_line="$(printf '%s' "$status_out" | grep '^Nix:' || true)"
+          [ -n "$nix_line" ] || { echo "::error::status printed no Nix line"; exit 1; }
+
+          reported="$(printf '%s' "$nix_line" | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+          actual="$(nix --version | sed 's/([^)]*)//g' | grep -oE '[0-9]+\.[0-9]+' | tail -1)"
+          [ "$reported" = "$actual" ] \
+            || { echo "::error::status reported Nix $reported but nix --version says $actual"; exit 1; }
+          echo "status agrees with nix --version: $reported"
+
+      # Standing gate for the scheduler-environment bug class.
+      #
+      # launchd/systemd/cron give a job a minimal environment: no XDG_*, and no
+      # Nix profile directory on PATH. A bug here passes every interactive test
+      # and then fails silently at 02:00 — which is exactly what happened when
+      # every nix invocation resolved via PATH. This runs the scheduler-invoked
+      # command paths under `env -i` from both the repo dir and PWD=/, and
+      # asserts up front that nix is genuinely absent from the minimal PATH so
+      # the check cannot pass vacuously.
+      - name: scheduler-environment command paths
+        run: ./ci/scheduler-env.sh ./target/release/synapse
+
+      - name: fresh install
+        run: ./ci/lifecycle.sh fresh-install
+
+      - name: update existing install
+        run: ./ci/lifecycle.sh update
+
+      - name: rollback
+        run: ./ci/lifecycle.sh rollback
+
+      - name: uninstall
+        run: ./ci/lifecycle.sh uninstall
+
+  # ── Coverage gate ─────────────────────────────────────────────────────────
+  coverage:
+    name: coverage (>80%)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # tui.rs draws to a terminal and main.rs is the clap entry point; neither
+      # is meaningfully coverable without a pty harness, so both are excluded
+      # rather than padded with tests that assert nothing.
+      - name: measure coverage
+        run: |
+          cargo llvm-cov --all-targets --locked \
+            --ignore-filename-regex '(tui\.rs|main\.rs|build\.rs)' \
+            --fail-under-lines 80 \
+            --summary-only
+
+  # ── Installer script ──────────────────────────────────────────────────────
+  #
+  # install.sh is POSIX sh because v1 targets macOS, Linux, and WSL2 (which is
+  # Linux), so `sh -n` and `shellcheck -s sh` are the right dialect gates.
+  # install-check.sh serves a fake release over localhost, so no network and no
+  # env setup is needed here.
+  installer:
+    name: installer script
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: posix syntax
+        run: sh -n install.sh
+
+      - name: shellcheck
+        run: shellcheck -s sh install.sh
+
+      - name: end-to-end install against a fake release
+        run: bash ci/install-check.sh
+
+  # ── Single required status check for branch protection ─────────────────────
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [lint, test, shell-integration, nix-flake, lifecycle, coverage, installer]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: verify every job succeeded
+        run: |
+          results='${{ join(needs.*.result, " ") }}'
+          echo "job results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::a required job did not succeed"; exit 1; }
+          done

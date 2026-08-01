@@ -1,0 +1,10 @@
+pub mod auto_update;
+pub mod doctor;
+pub mod list;
+pub mod log;
+pub mod rollback;
+pub mod setup;
+pub mod status;
+pub mod uninstall;
+pub mod update;
+pub mod version;

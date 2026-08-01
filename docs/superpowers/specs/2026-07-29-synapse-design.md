@@ -1,6 +1,7 @@
 # Synapse — Universal AI Tool Sync
 
-**Status**: Approved (pair-reviewed 2026-07-29, 20 findings resolved)
+**Status**: Approved (pair-reviewed 2026-07-29, 20 findings resolved; orchestrated review 2026-07-31 — 8 gaps addressed in Phase 6, 9 items deferred to v1.1)
+**Revised**: 2026-07-31 — v1 scope narrowed for tractability
 **Replaces**: skillshare (`~/.config/skillshare/`)
 
 ---
@@ -325,6 +326,27 @@ synapse validate
 ├─ Plugins: plugin.json present and valid, git remote reachable
 └─ Targets: paths exist, permissions are writable
 ```
+
+
+### v1 Scope (revised 2026-07-31)
+
+After orchestrated 3-agent review, the following are deferred from v1 to keep the
+initial release tractable:
+
+| Deferred | Reason | Target |
+|----------|--------|--------|
+| `_synapse_managed` MCP ownership marker | v1 synapse owns entire MCP file; warns on overwrite. Simpler, zero merge complexity. | v1.1 |
+| `synapse doctor` command | Re-running `synapse sync` repairs most issues. Doctor is a diagnostic tool. | v1.1 |
+| `synapse update` command | `git pull && synapse sync` covers it. | v1.1 |
+| Rules processor (sentinel markers) | Rules are small static files. Manual management works. | v1.1 |
+| Plugin settings conflict detection | Last-write-wins for conflicting settings.json keys from two plugins. | v1.1 |
+| Agent per-target transforms | Transforms undefined; skillshare's MCP injection is the main gap. | v1.1 |
+| Subagent sync | Ruler handles this (line 337). | TBD |
+
+v1 delivers: scaffold, config parser, skill+agent symlink sync (skillshare parity),
+MCP config sync (synapse owns files), plugin sync (symlinks + settings merge),
+migration from skillshare, validate, install/remove, lockfile, idempotency,
+`--dry-run`/`--force`/`--target` flags, and integration tests.
 
 ### What We Don't Build (YAGNI)
 
