@@ -180,13 +180,13 @@ fn dirs_from_env() -> PathBuf {
         }
     }
 
+    // HOME unset or empty — consult the passwd database so we never fabricate a
+    // relative path that resolves against the CWD (under launchd that is /).
     if let Some(home) = passwd_home() {
         return home.join(".config");
     }
 
-    // Last resort. Reached only when HOME is unset *and* the passwd lookup fails,
-    // which in practice means a broken environment; a relative path keeps the
-    // failure local and visible rather than scattering state into /tmp.
+    // Last resort: relative path keeps failure local and visible.
     PathBuf::from(".config")
 }
 
@@ -520,6 +520,8 @@ mod tests {
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", "/custom/home");
         let resolved = home_dir();
+
+        // Restore before the assertion so unwinding leaves the env clean
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),

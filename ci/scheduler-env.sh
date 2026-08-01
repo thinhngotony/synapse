@@ -171,18 +171,89 @@ fi
 # ── No HOME at all ──────────────────────────────────────────────────────────
 #
 # HOME is normally set by launchd, but `su`-style invocations drop it. State must
-# not silently land in /tmp.
+# land in the real home directory, derived from the passwd database.
+#
+# Design notes:
+# - We omit BOTH HOME and XDG_CONFIG_HOME. If XDG_CONFIG_HOME is present,
+#   dirs_from_env() returns early from the XDG branch and never touches the
+#   HOME/passwd logic at all, making this an empty test.
+# - We use `auto-update enable`, which unconditionally calls write_config()
+#   regardless of whether packages are installed. `update --all` with nothing
+#   installed exits before writing anything.
+# - We assert positively that the yaml appeared under the passwd home. A probe for
+#   known-bad paths (/tmp/.config, /tmp/synapse, ...) can only catch the exact
+#   wrong paths it lists; a whitelist catches every wrong answer.
 echo "== no HOME =="
-nohome_out="$(env -i PATH="$MINIMAL_PATH" "$SYNAPSE" status 2>&1)"
-nohome_rc=$?
-if [ "$nohome_rc" -ne 0 ]; then
-    note "::error::status failed with HOME unset: $nohome_out"
-    fail=1
-elif [ -d /tmp/.config/synapse ]; then
-    note "::error::state was written to /tmp/.config/synapse with HOME unset"
+
+# Derive the passwd home without using HOME so we are not just reading back the
+# variable under test.
+PASSWD_HOME="$(
+    python3 -c 'import pwd,os; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null ||
+    getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 ||
+    dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}'
+)"
+
+if [ -z "$PASSWD_HOME" ] || [ ! -d "$PASSWD_HOME" ]; then
+    note "::error::could not resolve the passwd home; cannot verify no-HOME path"
     fail=1
 else
-    echo "  ok    status works with HOME unset, no state under /tmp"
+    echo "  ok    passwd home: $PASSWD_HOME"
+    EXPECTED_YAML="$PASSWD_HOME/.config/synapse/auto-update.yaml"
+
+    # Move any pre-existing config aside so we observe only what this run writes.
+    STASH=''
+    if [ -e "$EXPECTED_YAML" ]; then
+        STASH="$(mktemp)"
+        cp "$EXPECTED_YAML" "$STASH"
+        rm -f "$EXPECTED_YAML"
+    fi
+
+    # Write through dirs_from_env with neither HOME nor XDG_CONFIG_HOME set.
+    write_out="$(env -i PATH="$MINIMAL_PATH" "$SYNAPSE" auto-update enable 2>&1)"
+    write_rc=$?
+    # disable to clean up, ignoring errors
+    env -i PATH="$MINIMAL_PATH" HOME="$PASSWD_HOME" "$SYNAPSE" auto-update disable \
+        >/dev/null 2>&1 || true
+
+    if [ "$write_rc" -ne 0 ]; then
+        note "::error::auto-update enable failed with HOME unset:"
+        note "$write_out"
+        fail=1
+    else
+        echo "  ok    auto-update enable returned 0 with HOME unset"
+    fi
+
+    # Positive assertion: yaml must have appeared under the passwd home.
+    if [ -e "$EXPECTED_YAML" ]; then
+        echo "  ok    config yaml at $EXPECTED_YAML"
+    else
+        note "::error::auto-update.yaml not found at $EXPECTED_YAML"
+        note "  It should have landed there because HOME was unset and"
+        note "  dirs_from_env() must fall back to the passwd home."
+        # Show where it actually went, if anywhere.
+        actual="$(find /tmp "$PASSWD_HOME" / -maxdepth 6 -name 'auto-update.yaml' \
+            2>/dev/null | head -5 || true)"
+        [ -n "$actual" ] && note "  Found at: $actual" || note "  Not found anywhere"
+        fail=1
+    fi
+
+    # Belt-and-suspenders: also assert no plausible wrong paths have the file.
+    for wrong in /tmp/.config/synapse/auto-update.yaml \
+                 /tmp/synapse/auto-update.yaml \
+                 /.config/synapse/auto-update.yaml \
+                 .config/synapse/auto-update.yaml; do
+        if [ -e "$wrong" ]; then
+            note "::error::config yaml appeared at $wrong — dirs_from_env() fell through to a wrong fallback"
+            fail=1
+        fi
+    done
+
+    # Restore whatever was there before.
+    if [ -n "$STASH" ]; then
+        mkdir -p "$(dirname "$EXPECTED_YAML")"
+        cp "$STASH" "$EXPECTED_YAML"
+        rm -f "$STASH"
+    fi
 fi
 
 if [ "$fail" -ne 0 ]; then
