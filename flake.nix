@@ -41,9 +41,9 @@
           version = "1.0.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          # Nix build sandbox has no system packages; tests that probe `which sh`
-          # need `sh` in the build environment.
-          nativeBuildInputs = [ pkgs.bash ];
+          # Nix build sandbox has no `which` binary; tests that probe
+          # `which <bin>` need it on PATH inside the sandbox.
+          nativeBuildInputs = [ pkgs.which ];
           meta.mainProgram = "synapse";
         };
       in
