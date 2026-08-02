@@ -384,7 +384,7 @@ jobs:
     steps:
       - name: verify every job succeeded
         run: |
-          results=${{ join(needs.*.result, ' ') }}
+          results="${{ join(needs.*.result, ' ') }}"
           echo "job results: $results"
           for r in $results; do
             [ "$r" = "success" ] || { echo "::error::a required job did not succeed"; exit 1; }
