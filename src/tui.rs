@@ -732,11 +732,11 @@ mod tests {
 
     #[test]
     fn doctor_check_returns_one_per_bin() {
-        let result = doctor_check(&["sh"]);
+        let result = doctor_check(&["true"]);
         assert_eq!(result.len(), 1);
-        // `sh` is present on all supported platforms.
-        assert_eq!(result[0].0, "sh");
-        assert!(result[0].1, "`sh` should be found");
+        // `true` is present on all supported platforms.
+        assert_eq!(result[0].0, "true");
+        assert!(result[0].1, "`true` should be found");
     }
 
     /// Rendering the full TUI at the declared minimum must not panic.

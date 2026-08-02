@@ -122,10 +122,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn which_finds_sh() {
+    fn which_finds_binary() {
         assert!(
-            which("sh"),
-            "`sh` must be on PATH on all supported platforms"
+            which("true"),
+            "`which`/`sh` must be available in the build/test environment"
         );
     }
 
