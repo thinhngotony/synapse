@@ -144,9 +144,9 @@ jobs:
   # ── Nix flake: this is what closes the darwin verification gap ─────────────
   #
   # SYN-2's derivations were only ever realised in a nixos/nix container
-  # (aarch64-linux). The macOS legs below are the first real proof that the
-  # darwin hashes transcribed from upstream checksums.txt are correct, and that
-  # bun 1.3.14's darwin binaries and omp's darwin natives resolve.
+  # Note: x86_64-darwin is omitted because nixpkgs-unstable dropped support;
+  # the release.yml build uses native rustc instead. The remaining legs verify
+  # that the nix derivations build and that bun/omp darwin binaries resolve.
   nix-flake:
     name: nix ${{ matrix.nix_system }}
     runs-on: ${{ matrix.os }}
@@ -154,8 +154,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
-            nix_system: x86_64-darwin
           - os: macos-14
             nix_system: aarch64-darwin
           - os: ubuntu-22.04
