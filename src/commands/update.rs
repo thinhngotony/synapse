@@ -35,6 +35,9 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     // Find the flake dir — use the directory of the running binary, falling
     // back to the current directory (works for dev and installed layouts).
     let flake_dir = locate_flake_dir();
+
+    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
+
     let nix_bin = match crate::nix::resolve_bin() {
         Some(b) => b,
         None => {
@@ -45,8 +48,6 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
             std::process::exit(1);
         }
     };
-
-    let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut any_updated = false;
     for name in &targets {
