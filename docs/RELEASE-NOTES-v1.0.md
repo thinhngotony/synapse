@@ -103,7 +103,7 @@ Deferred to keep the release scoped:
 
 ## Verification
 
-- 92 unit tests, 3 integration tests
+- 110 unit tests, 3 integration tests
 - `cargo clippy --all-targets -- -D warnings` clean
 - Flake packages built and smoke-run on aarch64-darwin against Determinate Nix 3.21.9
 - CI matrix covers macOS 13/14 and Ubuntu 22.04 x86_64/ARM: build, test, clippy, shell integration

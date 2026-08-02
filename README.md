@@ -26,20 +26,43 @@ three versions of every package so a bad update is one command to undo.
 
 ## Install
 
-Synapse requires **Nix 2.24 or newer**. It does not install Nix for you: on macOS the official
-installer creates a dedicated APFS volume and modifies system files, which is not a change to make
-on your behalf.
+### Quick start (no prerequisites)
+
+The bootstrap script downloads and installs the `synapse` binary, then tells you
+what to do next. Nix does not have to be installed first — the script detects
+whether it is present and gives instructions if not.
 
 ```bash
-# 1. Install Nix (if you don't have it)
-curl -fsSL https://install.determinate.systems/nix | sh -s -- install
-
-# 2. Install Synapse
-nix profile install github:thinhngotony/synapse
-
-# 3. Install the harness
-synapse install
+curl -fsSL https://synapse.hyberorbit.com/install | sh
 ```
+
+After that, run `synapse install` to open the interactive TUI and install the AI
+harness packages (herdr, omp, skillshare).
+
+### Manual / developer install (Nix already installed)
+
+If you already have Nix 2.24+ and prefer to manage Synapse through your Nix
+profile:
+
+```bash
+nix profile install github:thinhngotony/synapse
+synapse install   # open the TUI to install the harness packages
+```
+
+`synapse doctor` will tell you if anything is missing or misconfigured.
+
+### Installing Nix
+
+Neither method requires you to install Nix first — the curl bootstrap detects
+its absence and gives instructions. If you want to install it yourself, the
+Determinate Systems installer is the recommended path:
+
+```bash
+curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+```
+
+On macOS this creates a dedicated APFS volume and modifies system files; run it
+yourself rather than having Synapse do it on your behalf.
 
 `synapse doctor` will tell you if anything is missing or misconfigured.
 
