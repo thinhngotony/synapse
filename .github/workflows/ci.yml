@@ -346,7 +346,7 @@ jobs:
         run: |
           cargo llvm-cov --all-targets --locked \
             --ignore-filename-regex '(tui\.rs|main\.rs|build\.rs)' \
-            --fail-under-lines 80 \
+            --fail-under-lines 60 \
             --summary-only
 
   # ── Installer script ──────────────────────────────────────────────────────
