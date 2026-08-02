@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [master]
+jobs:
+  lint:
+    name: clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (all targets)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: shell scripts parse
+        run: |
+          set -euo pipefail
+          for f in ci/*.sh; do
+            bash -n "$f" || { echo "::error::$f has a syntax error"; exit 1; }
+          done
+      - name: nix version parser self-test
+        run: ./ci/check-nix-version.sh --self-test
