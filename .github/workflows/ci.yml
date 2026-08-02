@@ -304,15 +304,23 @@ jobs:
         run: ./ci/scheduler-env.sh ./target/release/synapse
 
       - name: fresh install
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/synapse-lifecycle
         run: ./ci/lifecycle.sh fresh-install
 
       - name: update existing install
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/synapse-lifecycle
         run: ./ci/lifecycle.sh update
 
       - name: rollback
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/synapse-lifecycle
         run: ./ci/lifecycle.sh rollback
 
       - name: uninstall
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/synapse-lifecycle
         run: ./ci/lifecycle.sh uninstall
 
   # ── Coverage gate ─────────────────────────────────────────────────────────
