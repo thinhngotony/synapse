@@ -2,7 +2,7 @@
   description = "Synapse — single-command AI harness installer and auto-updater";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -41,6 +41,9 @@
           version = "1.0.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # Nix build sandbox has no system packages; tests that probe `which sh`
+          # need `sh` in the build environment.
+          nativeBuildInputs = [ pkgs.bash ];
           meta.mainProgram = "synapse";
         };
       in
