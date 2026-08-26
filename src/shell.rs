@@ -59,6 +59,13 @@ impl Shell {
     pub fn path_snippet(self) -> String {
         match self {
             Shell::Bash | Shell::Zsh => concat!(
+                "# Synapse managed packages\n",
+                "_synapse_profile=\"${SYNAPSE_PROFILE:-$HOME/.local/share/synapse/profile}\"\n",
+                "case \":$PATH:\" in\n",
+                "  *\":$_synapse_profile/bin:\"*) ;;\n",
+                "  *) PATH=\"$_synapse_profile/bin:$PATH\" ;;\n",
+                "esac\n",
+                "unset _synapse_profile\n",
                 "# Nix single-user profile\n",
                 "if [ -e \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ]; then\n",
                 "  . \"$HOME/.nix-profile/etc/profile.d/nix.sh\"\n",
@@ -71,6 +78,15 @@ impl Shell {
             )
             .to_string(),
             Shell::Fish => concat!(
+                "# Synapse managed packages\n",
+                "set synapse_managed_profile \"$HOME/.local/share/synapse/profile\"\n",
+                "if set -q SYNAPSE_PROFILE\n",
+                "    set synapse_managed_profile \"$SYNAPSE_PROFILE\"\n",
+                "end\n",
+                "if test -d \"$synapse_managed_profile/bin\"\n",
+                "    fish_add_path --path --prepend \"$synapse_managed_profile/bin\"\n",
+                "end\n",
+                "set -e synapse_managed_profile\n",
                 "# Nix single-user profile\n",
                 "if test -d \"$HOME/.nix-profile/bin\"\n",
                 "    fish_add_path --path --prepend \"$HOME/.nix-profile/bin\"\n",

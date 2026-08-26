@@ -1,10 +1,10 @@
 [package]
 name = "synapse"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.78"
 authors = ["Synapse Contributors"]
-description = "Single-command AI harness installer and auto-updater"
+description = "Portable AI harness installer, stack restore, and auto-updater"
 license = "MIT"
 
 [dependencies]

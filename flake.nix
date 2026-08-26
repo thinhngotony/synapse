@@ -1,5 +1,5 @@
 {
-  description = "Synapse — single-command AI harness installer and auto-updater";
+  description = "Synapse — portable AI harness installer, stack restore, and auto-updater";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -35,10 +35,10 @@
         bun = pkgs.callPackage ./nix/bun.nix { };
         omp = pkgs.callPackage ./nix/omp.nix { inherit bun; };
 
-        # The Rust CLI itself (SYN-1 scaffold).
+        # The Rust CLI itself.
         synapse = pkgs.rustPlatform.buildRustPackage {
           pname = "synapse";
-          version = "1.0.0";
+          version = "1.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           # Nix build sandbox has no `which` binary; tests that probe
@@ -78,7 +78,7 @@
             # Parallel package builds; CI uses it to fan out the platform matrix.
             nix-fast-build
             cachix
-            nixfmt-rfc-style
+            nixfmt
           ];
         };
       }

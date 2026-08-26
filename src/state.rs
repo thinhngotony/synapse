@@ -56,12 +56,13 @@ pub struct State {
 }
 
 impl State {
+    #[cfg(test)]
     /// Record a successful install or update of a package.
     pub fn set_package(&mut self, name: impl Into<String>, version: impl Into<String>) {
         self.set_package_with_path(name, version, None);
     }
 
-    /// Like [`State::set_package`], also recording the Nix store path.
+    /// Record a successful install or update together with its Nix store path.
     ///
     /// When the package was already installed at a *different* version, that
     /// version is pushed onto the history (newest first, capped at

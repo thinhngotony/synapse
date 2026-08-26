@@ -7,14 +7,14 @@
   makeWrapper,
 }:
 let
-  version = "17.2.2";
+  version = "18.0.4";
 
   # The upstream package is published to npm only (no source repo tarball), and
   # dist/cli.js is a pre-bundled Bun script with a `#!/usr/bin/env bun` shebang.
   # So this is a fetch + resolve-deps + wrap job, not a compile.
   src = fetchurl {
     url = "https://registry.npmjs.org/@oh-my-pi/pi-coding-agent/-/pi-coding-agent-${version}.tgz";
-    hash = "sha256-5Vw1IYgOiOO7TxRbx1q02YPiQPkEXX/OaBDwrTuMs/Y=";
+    hash = "sha512-vi2vZGsZ/OigD3f8M+Qixreuk7afU5P6Qe2JlcW6nTWOC48zYXeY4QZGPsM3R0Ata4xPGNWDtCKCgKjx6KO00A==";
   };
 
   # dist/cli.js resolves these at runtime rather than inlining them. The
@@ -41,7 +41,7 @@ buildNpmPackage (finalAttrs: {
     cp ${./omp/package-lock.json} package-lock.json
   '';
 
-  npmDepsHash = "sha256-qIIxPS2Gt8DcwwzYQF+Xv3ywqocAcCgqRizot4oEmz8=";
+  npmDepsHash = "sha256-Sqxgo1bi+qFrIkUhLjXJLyiXwres/cIEAYBNe59RMuc=";
 
   # No build script, and lifecycle scripts in the dep tree must not run.
   dontNpmBuild = true;

@@ -4,10 +4,8 @@ use crate::state;
 
 /// `synapse uninstall [package] [--all]`
 ///
-/// Drops packages from Synapse's state and, once nothing is left managed,
-/// removes the managed shell block. Store paths are left for
-/// `nix-collect-garbage`: deleting them directly would break any other profile
-/// that still references them.
+/// Removes packages from Synapse's dedicated Nix profile and state. Store paths
+/// remain available through older profile generations until garbage collection.
 pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     let cfg = state::config_dir();
     let mut st = state::read(&cfg)?;
@@ -33,6 +31,9 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     };
 
     let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
+    let nix_bin = crate::nix::resolve_bin()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nix not found"))?;
+    let mut failures = Vec::new();
 
     for name in &targets {
         let version = st
@@ -40,13 +41,28 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
             .get(name)
             .map(|r| r.version.clone())
             .unwrap_or_default();
+        if let Err(error) = crate::commands::update::remove_profile_package(&nix_bin, name) {
+            eprintln!("warning: could not remove {name} from the Nix profile: {error}");
+            failures.push(format!("{name}: {error}"));
+            continue;
+        }
         st.remove_package(name);
-        println!("  {name} {version} removed from Synapse state");
+        if let Err(error) = state::write(&cfg, &st) {
+            let rollback = crate::commands::update::undo_profile_remove(&nix_bin, name).err();
+            return Err(io::Error::new(
+                error.kind(),
+                match rollback {
+                    Some(rollback) => {
+                        format!("write state: {error}; profile rollback: {rollback}")
+                    }
+                    None => format!("write state: {error}"),
+                },
+            ));
+        }
+        println!("  {name} {version} removed from the Synapse profile");
         let _ =
             crate::commands::log::append(&format!("{} uninstalled {name} {version}", now_secs()));
     }
-
-    state::write(&cfg, &st)?;
 
     // Only strip shell config once nothing is managed; otherwise the remaining
     // packages lose their PATH entry.
@@ -59,14 +75,24 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("warning: could not clean shell config: {e}"),
+            Err(error) => {
+                eprintln!("warning: could not clean shell config: {error}");
+                failures.push(format!("shell config: {error}"));
+            }
         }
     }
 
-    println!("\nStore paths are left in place. To reclaim disk space:");
-    println!("  nix-collect-garbage -d");
+    println!("\nOlder profile generations retain rollback paths.");
+    println!("Run `nix-collect-garbage -d` to reclaim them.");
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "package uninstall failed: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 /// Strip the managed marker block from every configured shell rc.

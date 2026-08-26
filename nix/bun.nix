@@ -32,8 +32,7 @@ let
 
   inherit (stdenvNoCC.hostPlatform) system;
 
-  source =
-    sources.${system} or (throw "bun ${version}: no upstream build for system ${system}");
+  source = sources.${system} or (throw "bun ${version}: no upstream build for system ${system}");
 in
 bun.overrideAttrs (old: {
   inherit version;

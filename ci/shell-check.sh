@@ -47,6 +47,8 @@ run_setup
 echo "== $SHELL_NAME: second run (idempotency)"
 second_output="$(run_setup)"
 
+# Assertion commands deliberately return non-zero before `check` records them.
+set +e
 # --- rc file is valid syntax for this shell --------------------------------
 "$SHELL_NAME" -n "$RC" >/dev/null 2>&1
 check "rc parses as valid $SHELL_NAME" $?
@@ -65,7 +67,9 @@ printf '%s' "$second_output" | grep -q 'already configured'
 check "second run reported 'already configured'" $?
 
 # --- no temp file left behind ---------------------------------------------
-! ls "$FAKE"/.*synapse-tmp >/dev/null 2>&1
+ls "$FAKE"/.*synapse-tmp >/dev/null 2>&1
+tmp_status=$?
+[ "$tmp_status" -ne 0 ]
 check "no .synapse-tmp left behind" $?
 
 # --- completions were generated where the rc expects them ------------------
@@ -77,17 +81,29 @@ esac
 [ -r "$COMP" ]
 check "completion script exists at $COMP" $?
 
+grep -q 'SYNAPSE_PROFILE' "$RC" && grep -q '.local/share/synapse/profile' "$RC"
+check "managed profile PATH is configured" $?
+
+CUSTOM_PROFILE="$FAKE/custom-profile"
+mkdir -p "$CUSTOM_PROFILE/bin"
+
 # --- shell-specific behaviour ---------------------------------------------
 case "$SHELL_NAME" in
   bash)
     # PATH must gain the profile exactly once, even after sourcing twice.
-    count="$(HOME="$FAKE" bash -c '
+    count="$(HOME="$FAKE" PATH=/usr/bin:/bin bash -c '
       source "$HOME/.bashrc" >/dev/null 2>&1
       source "$HOME/.bashrc" >/dev/null 2>&1
       printf "%s" "$PATH" | tr ":" "\n" | grep -c "nix-profile/bin"
     ' || true)"
     [ "$count" = "1" ]
     check "PATH has exactly 1 nix-profile entry after 2 sources (got $count)" $?
+    HOME="$FAKE" SYNAPSE_PROFILE="$CUSTOM_PROFILE" PATH=/usr/bin:/bin bash -c '
+      source "$HOME/.bashrc" >/dev/null 2>&1
+      case ":$PATH:" in *":$SYNAPSE_PROFILE/bin:"*) exit 0 ;; *) exit 1 ;; esac
+    ' >/dev/null 2>&1
+    check "bash PATH respects SYNAPSE_PROFILE" $?
+
 
     # The real proof that completions load, not just that the file exists.
     HOME="$FAKE" bash -c 'source "$HOME/.bashrc" >/dev/null 2>&1; type -t _synapse' >/dev/null 2>&1
@@ -100,6 +116,12 @@ case "$SHELL_NAME" in
       case ":$PATH:" in *":$HOME/.nix-profile/bin:"*) exit 0 ;; *) exit 1 ;; esac
     ' >/dev/null 2>&1
     check "zsh PATH contains nix-profile" $?
+    HOME="$FAKE" SYNAPSE_PROFILE="$CUSTOM_PROFILE" PATH=/usr/bin:/bin zsh -c '
+      source "$HOME/.zshrc" >/dev/null 2>&1
+      case ":$PATH:" in *":$SYNAPSE_PROFILE/bin:"*) exit 0 ;; *) exit 1 ;; esac
+    ' >/dev/null 2>&1
+    check "zsh PATH respects SYNAPSE_PROFILE" $?
+
 
     zsh -n "$COMP" >/dev/null 2>&1
     check "zsh completion script parses" $?
@@ -126,6 +148,12 @@ case "$SHELL_NAME" in
     # what makes them load; confirm fish itself accepts the script.
     fish -n "$COMP" >/dev/null 2>&1
     check "fish completion script parses" $?
+    # shellcheck disable=SC2016  # expanded by the child fish process
+    HOME="$FAKE" SYNAPSE_PROFILE="$CUSTOM_PROFILE" fish -c '
+      source "$HOME/.config/fish/config.fish" >/dev/null 2>&1
+      contains -- "$SYNAPSE_PROFILE/bin" $PATH
+    ' >/dev/null 2>&1
+    check "fish PATH respects SYNAPSE_PROFILE" $?
     ;;
 esac
 

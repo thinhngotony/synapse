@@ -7,6 +7,8 @@ mod state;
 mod test_utils;
 mod tui;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -58,9 +60,46 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Capture, restore, and inspect portable AI stack state
+    #[command(subcommand)]
+    Stack(StackCommands),
     /// Manage the auto-update scheduler
     #[command(subcommand)]
     AutoUpdate(AutoUpdateCommands),
+}
+
+#[derive(Subcommand)]
+enum StackCommands {
+    /// Capture OMP plugins/MCP and Skillshare's Git source
+    Capture {
+        /// Tracked output directory; defaults inside Skillshare's Git root
+        #[arg(long, value_name = "DIR")]
+        output: Option<PathBuf>,
+    },
+    /// Restore a captured stack
+    Restore {
+        /// Captured stack directory; defaults inside Skillshare's Git root
+        #[arg(long, value_name = "DIR")]
+        input: Option<PathBuf>,
+        /// Skillshare Git remote to clone before restoring on a new machine
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
+        /// Skillshare Git scope used with --remote
+        #[arg(long, default_value = "root", value_name = "SCOPE")]
+        git_root: String,
+        /// Confirm that plugins and MCP commands in the stack may execute code
+        #[arg(long)]
+        trust: bool,
+        /// Replace conflicting MCP server definitions
+        #[arg(long)]
+        force: bool,
+    },
+    /// Inspect a captured stack and missing environment variables
+    Status {
+        /// Captured stack directory; defaults inside Skillshare's Git root
+        #[arg(long, value_name = "DIR")]
+        input: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,6 +136,23 @@ fn main() {
         Some(Commands::Uninstall { package, all }) => {
             commands::uninstall::run(package.as_deref(), all)
         }
+        Some(Commands::Stack(sub)) => match sub {
+            StackCommands::Capture { output } => commands::stack::capture(output.as_deref()),
+            StackCommands::Restore {
+                input,
+                remote,
+                git_root,
+                trust,
+                force,
+            } => commands::stack::restore(
+                input.as_deref(),
+                remote.as_deref(),
+                &git_root,
+                trust,
+                force,
+            ),
+            StackCommands::Status { input } => commands::stack::status(input.as_deref()),
+        },
         Some(Commands::AutoUpdate(sub)) => match sub {
             AutoUpdateCommands::Enable => commands::auto_update::enable(),
             AutoUpdateCommands::Disable => commands::auto_update::disable(),

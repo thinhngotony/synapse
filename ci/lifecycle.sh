@@ -21,13 +21,24 @@ if [ ! -x "$SYNAPSE" ]; then
     exit 1
 fi
 : "${XDG_CONFIG_HOME:?XDG_CONFIG_HOME must be set so stages share state}"
+export SYNAPSE_PROFILE="${SYNAPSE_PROFILE:-$XDG_CONFIG_HOME/synapse-profile}"
+export SYNAPSE_FLAKE_DIR="${SYNAPSE_FLAKE_DIR:-$PWD}"
+NIX_BIN="${NIX_BIN:-$(command -v nix || true)}"
+if [ -z "$NIX_BIN" ] && [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  NIX_BIN=/nix/var/nix/profiles/default/bin/nix
+fi
+: "${NIX_BIN:?nix is required for lifecycle profile assertions}"
 
 STATE_FILE="$XDG_CONFIG_HOME/synapse/state.json"
 
 fail=0
-note() { printf '%s\n' "$*" >&2; }
 check() { # check <label> <expr>
-  eval "if $2; then echo \"  ok    $1\"; else note \"::error::$1\"; fail=1; fi"
+  if eval "$2"; then
+    echo "  ok    $1"
+  else
+    printf '::error::%s\n' "$1" >&2
+    fail=1
+  fi
 }
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -48,11 +59,19 @@ state_history_version() { # state_history_version <pkg> <index>
 stage_fresh_install() {
   echo "=== fresh-install ==="
 
-  # Populate state directly: the TUI install is interactive; lifecycle CI tests
-  # the state-management contract, not the TUI paint loop.
-  mkdir -p "$XDG_CONFIG_HOME/synapse"
-  printf '{"packages":{"herdr":{"version":"0.7.4","installed_at":1785542400}}}\n' \
-    > "$STATE_FILE"
+  # Seed a distinct old closure so executable output proves the profile really
+  # transitions old → new → old across update and rollback.
+  mkdir -p "$XDG_CONFIG_HOME/synapse" "$XDG_CONFIG_HOME/herdr/bin"
+  cat > "$XDG_CONFIG_HOME/herdr/bin/herdr" <<'EOF'
+#!/bin/sh
+echo 'herdr 0.7.4'
+EOF
+  chmod 755 "$XDG_CONFIG_HOME/herdr/bin/herdr"
+  store_path="$("$NIX_BIN" store add-path "$XDG_CONFIG_HOME/herdr")"
+  "$NIX_BIN" profile install --profile "$SYNAPSE_PROFILE" "$store_path"
+  jq -n --arg store "$store_path" '
+    {packages:{herdr:{version:"0.7.4",installed_at:1785542400,store_path:$store}}}
+  ' > "$STATE_FILE"
 
   # Smoke: read-only commands work with this state.
   "$SYNAPSE" list >/dev/null
@@ -62,6 +81,8 @@ stage_fresh_install() {
   actual="$(state_version herdr)"
   check "herdr recorded as 0.7.4" "[ \"$actual\" = '0.7.4' ]"
   check "no history on fresh install" "[ \"$(state_history_len herdr)\" -eq 0 ]"
+  check "old executable prints 0.7.4" \
+    "\"$SYNAPSE_PROFILE/bin/herdr\" --version | grep -q '0.7.4'"
   check "log created after list" "\"$SYNAPSE\" log >/dev/null"
 
   echo "fresh-install complete"
@@ -74,20 +95,15 @@ stage_update() {
   before="$(state_version herdr)"
   check "herdr present before update" "[ -n \"$before\" ]"
 
-  # Simulate a successful update by writing new state as set_package_with_path
-  # would produce it. Nix may not be installed on all CI legs; what we're
-  # testing here is the state contract, not the nix build.
-  jq --arg new "0.7.5" --arg old "$before" '
-    .packages.herdr.history = [{"version": $old, "installed_at": .packages.herdr.installed_at, "store_path": null}] |
-    .packages.herdr.version = $new |
-    .packages.herdr.installed_at = 1785546000
-  ' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  "$SYNAPSE" update herdr
 
   # Assert the outcome the update command is contractually obligated to produce.
   check "version bumped to 0.7.5" "[ \"$(state_version herdr)\" = '0.7.5' ]"
   check "old version in history" "[ \"$(state_history_version herdr 0)\" = '$before' ]"
   check "history length is 1" "[ \"$(state_history_len herdr)\" -eq 1 ]"
   check "state.json still valid" "jq '.' \"$STATE_FILE\" >/dev/null 2>&1"
+  check "updated executable prints 0.7.5" \
+    "\"$SYNAPSE_PROFILE/bin/herdr\" --version | grep -q '0.7.5'"
 
   # synapse list must reflect the updated version.
   list_out="$("$SYNAPSE" list)"
@@ -106,12 +122,9 @@ stage_rollback() {
   check "version before rollback is 0.7.5" "[ \"$before\" = '0.7.5' ]"
   check "history has 0.7.4" "[ \"$before_hist\" = '0.7.4' ]"
 
-  # synapse rollback writes state.json: the bad version is dropped, history
-  # entry is restored as current. Since nix isn't guaranteed on all legs, the
-  # nix-store path check falls back gracefully (rollback.rs handles this).
-  # We verify the state.json outcome, which is the SYN-8 acceptance criterion.
-  "$SYNAPSE" rollback herdr 2>&1 | tee /tmp/rollback-out.txt || true
-  rollback_output="$(cat /tmp/rollback-out.txt)"
+  # Rollback must repoint the dedicated profile to the recorded store path,
+  # not merely change state.json.
+  "$SYNAPSE" rollback herdr
 
   after="$(state_version herdr)"
 
@@ -120,6 +133,8 @@ stage_rollback() {
   check "bad version gone from history" \
     "! jq -e '.packages.herdr.history[] | select(.version == \"0.7.5\")' \"$STATE_FILE\" >/dev/null 2>&1"
   check "state.json still valid" "jq '.' \"$STATE_FILE\" >/dev/null 2>&1"
+  check "rolled-back executable prints 0.7.4" \
+    "\"$SYNAPSE_PROFILE/bin/herdr\" --version | grep -q '0.7.4'"
 
   echo "rollback complete"
 }
@@ -143,6 +158,7 @@ stage_uninstall() {
   # Outcome: state is empty.
   pkg_count="$(jq '.packages | length' "$STATE_FILE" 2>/dev/null || echo -1)"
   check "state.json is empty after uninstall" "[ \"$pkg_count\" -eq 0 ]"
+  check "uninstalled executable removed from profile" "[ ! -e \"$SYNAPSE_PROFILE/bin/herdr\" ]"
 
   # Outcome: managed shell block removed. The block must actually be gone, not
   # just that setup-shell might have failed — check the file content directly.
