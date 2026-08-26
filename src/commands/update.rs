@@ -147,7 +147,9 @@ pub fn replace_profile_package(
         .map_err(|error| format!("create profile directory: {error}"))?;
     let binary = profile.join("bin").join(name);
     let had_previous = is_executable(&binary);
-    remove_profile_package(nix_bin, name)?;
+    if had_previous {
+        remove_profile_package(nix_bin, name)?;
+    }
 
     let status = Command::new(nix_bin)
         .args([
@@ -560,7 +562,7 @@ mod tests {
             None => std::env::remove_var("SYNAPSE_PROFILE"),
         }
 
-        assert!(calls.contains("profile remove"));
+        assert!(!calls.contains("profile remove"));
         assert!(calls.contains("profile add"));
         assert!(calls.contains("github:example/synapse#omp"));
         assert!(!calls.contains(" build "));
