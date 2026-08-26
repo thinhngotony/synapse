@@ -68,7 +68,7 @@ echo 'herdr 0.7.4'
 EOF
   chmod 755 "$XDG_CONFIG_HOME/herdr/bin/herdr"
   store_path="$("$NIX_BIN" store add-path "$XDG_CONFIG_HOME/herdr")"
-  "$NIX_BIN" profile add --profile "$SYNAPSE_PROFILE" "$store_path"
+  "$NIX_BIN" profile install --profile "$SYNAPSE_PROFILE" "$store_path"
   jq -n --arg store "$store_path" '
     {packages:{herdr:{version:"0.7.4",installed_at:1785542400,store_path:$store}}}
   ' > "$STATE_FILE"

@@ -157,7 +157,7 @@ pub fn replace_profile_package(
             "nix-command flakes",
             "--no-accept-flake-config",
             "profile",
-            "add",
+            "install",
             "--profile",
         ])
         .arg(&profile)
@@ -172,7 +172,7 @@ pub fn replace_profile_package(
             if had_previous {
                 let _ = rollback_profile(nix_bin);
             }
-            return Err(format!("start nix profile add: {error}"));
+            return Err(format!("start nix profile install: {error}"));
         }
     };
     if !status.success() {
@@ -180,7 +180,7 @@ pub fn replace_profile_package(
             let _ = rollback_profile(nix_bin);
         }
         return Err(format!(
-            "nix profile add exited {}",
+            "nix profile install exited {}",
             status.code().unwrap_or(-1)
         ));
     }
@@ -524,7 +524,7 @@ mod tests {
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> \"$SYNAPSE_NIX_TEST_LOG\"\n\
              case \" $* \" in\n\
-               *' profile add '*)\n\
+               *' profile install '*)\n\
                  mkdir -p \"$SYNAPSE_PROFILE/bin\"\n\
                  printf '#!/bin/sh\\n' > \"$SYNAPSE_PROFILE/bin/omp\"\n\
                  chmod 755 \"$SYNAPSE_PROFILE/bin/omp\"\n\
@@ -563,7 +563,7 @@ mod tests {
         }
 
         assert!(!calls.contains("profile remove"));
-        assert!(calls.contains("profile add"));
+        assert!(calls.contains("profile install"));
         assert!(calls.contains("github:example/synapse#omp"));
         assert!(!calls.contains(" build "));
         assert!(profile.join("bin/omp").is_file());

@@ -69,6 +69,7 @@ run_minimal() {
         PATH="$MINIMAL_PATH" \
         HOME="$HOME" \
         XDG_CONFIG_HOME="$WORK/config" \
+        SYNAPSE_PROFILE="$WORK/profile" \
         "$SYNAPSE" "$@" 2>&1)"
     rc=$?
 
@@ -79,6 +80,7 @@ run_minimal() {
         PATH="$MINIMAL_PATH" \
         HOME="$HOME" \
         XDG_CONFIG_HOME="$WORK/config" \
+        SYNAPSE_PROFILE="$WORK/profile" \
         "$SYNAPSE" "$@" 2>&1)"
     rc_root=$?
 
