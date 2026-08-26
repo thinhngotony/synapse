@@ -41,15 +41,13 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
     let nix_bin = match crate::nix::resolve_bin() {
         Some(b) => b,
         None => {
-            eprintln!("error: nix not found; cannot build packages");
-            if let Some(a) = crate::nix::advice(&crate::nix::NixStatus::Missing) {
-                eprintln!("\n{a}");
-            }
-            std::process::exit(1);
+            let advice = crate::nix::advice(&crate::nix::NixStatus::Missing)
+                .unwrap_or_else(|| "nix is required".to_string());
+            return Err(io::Error::new(io::ErrorKind::NotFound, advice));
         }
     };
+    let mut failures = Vec::new();
 
-    let mut any_updated = false;
     for name in &targets {
         let pkg = PACKAGES.iter().find(|p| p.name == name);
         let nix_attr = pkg.map(|p| p.nix_attr).unwrap_or(name.as_str());
@@ -60,21 +58,29 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
             .map(|r| r.version.clone())
             .unwrap_or_else(|| "unknown".into());
 
-        print!("  {name}: building…");
+        print!("  {name}: updating…");
         io::Write::flush(&mut io::stdout())?;
 
         match build_package(nix_attr, &flake_dir, &nix_bin) {
-            Ok(new_version) => {
+            Ok((new_version, had_previous)) => {
+                let store_path = store_path_of(nix_attr, &flake_dir, &nix_bin);
+                st.set_package_with_path(name.clone(), new_version.clone(), store_path);
+                if let Err(error) = state::write(&cfg, &st) {
+                    let rollback = undo_profile_replace(&nix_bin, name, had_previous).err();
+                    return Err(io::Error::new(
+                        error.kind(),
+                        match rollback {
+                            Some(rollback) => {
+                                format!("write state: {error}; profile rollback: {rollback}")
+                            }
+                            None => format!("write state: {error}"),
+                        },
+                    ));
+                }
                 if new_version == old_version {
                     println!(" already up to date ({old_version})");
                 } else {
                     println!(" {old_version} → {new_version}");
-                    // Route through set_package_with_path rather than inserting a
-                    // PackageRecord literal: it maintains the rollback history and
-                    // does not need touching when the record gains a field.
-                    let store_path = store_path_of(nix_attr, &flake_dir, &nix_bin);
-                    st.set_package_with_path(name.clone(), new_version.clone(), store_path);
-
                     let entry = format!(
                         "{} updated {name} {old_version} -> {new_version}",
                         SystemTime::now()
@@ -83,78 +89,258 @@ pub fn run(package: Option<&str>, all: bool) -> io::Result<()> {
                             .unwrap_or(0)
                     );
                     let _ = crate::commands::log::append(&entry);
-                    any_updated = true;
                 }
             }
-            Err(msg) => {
-                println!(" FAILED: {msg}");
+            Err(message) => {
+                println!(" FAILED: {message}");
+                failures.push(format!("{name}: {message}"));
             }
         }
     }
 
-    if any_updated {
-        state::write(&cfg, &st)?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "package update failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+pub fn flake_attr(flake_dir: &std::path::Path, attribute: &str) -> String {
+    let explicit_local = std::env::var_os("SYNAPSE_FLAKE_DIR")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|path| path == flake_dir && path.join("flake.nix").is_file());
+    if explicit_local {
+        return format!(".#{attribute}");
+    }
+    let reference = std::env::var("SYNAPSE_FLAKE_REF")
+        .ok()
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
+        .unwrap_or_else(|| "github:thinhngotony/synapse".to_string());
+    format!("{}#{attribute}", reference.trim_end_matches('#'))
+}
+
+pub fn synapse_profile() -> Result<std::path::PathBuf, String> {
+    if let Some(path) = std::env::var_os("SYNAPSE_PROFILE") {
+        if !path.is_empty() {
+            return Ok(path.into());
+        }
+    }
+    crate::state::home_dir()
+        .map(|home| home.join(".local/share/synapse/profile"))
+        .ok_or_else(|| "cannot resolve Synapse Nix profile path".to_string())
+}
+
+pub fn replace_profile_package(
+    nix_bin: &str,
+    name: &str,
+    installable: &str,
+    working_dir: &std::path::Path,
+) -> Result<bool, String> {
+    let profile = synapse_profile()?;
+    let parent = profile
+        .parent()
+        .ok_or_else(|| "Synapse Nix profile has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create profile directory: {error}"))?;
+    let binary = profile.join("bin").join(name);
+    let had_previous = is_executable(&binary);
+    remove_profile_package(nix_bin, name)?;
+
+    let status = Command::new(nix_bin)
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--no-accept-flake-config",
+            "profile",
+            "add",
+            "--profile",
+        ])
+        .arg(&profile)
+        .arg(installable)
+        .args(["--no-write-lock-file", "--refresh"])
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .status();
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if had_previous {
+                let _ = rollback_profile(nix_bin);
+            }
+            return Err(format!("start nix profile add: {error}"));
+        }
+    };
+    if !status.success() {
+        if had_previous {
+            let _ = rollback_profile(nix_bin);
+        }
+        return Err(format!(
+            "nix profile add exited {}",
+            status.code().unwrap_or(-1)
+        ));
     }
 
-    Ok(())
+    if !is_executable(&binary) {
+        let _ = rollback_profile(nix_bin);
+        if had_previous {
+            let _ = rollback_profile(nix_bin);
+        }
+        return Err(format!(
+            "profile install did not expose executable {}",
+            binary.display()
+        ));
+    }
+    Ok(had_previous)
+}
+
+pub fn remove_profile_package(nix_bin: &str, name: &str) -> Result<(), String> {
+    let profile = synapse_profile()?;
+    let status = Command::new(nix_bin)
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--no-accept-flake-config",
+            "profile",
+            "remove",
+            "--profile",
+        ])
+        .arg(profile)
+        .arg(name)
+        .status()
+        .map_err(|error| format!("start nix profile remove: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "nix profile remove exited {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn rollback_profile(nix_bin: &str) -> Result<(), String> {
+    let profile = synapse_profile()?;
+    let status = Command::new(nix_bin)
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--no-accept-flake-config",
+            "profile",
+            "rollback",
+            "--profile",
+        ])
+        .arg(profile)
+        .status()
+        .map_err(|error| format!("start nix profile rollback: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "nix profile rollback exited {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+pub fn undo_profile_replace(nix_bin: &str, name: &str, had_previous: bool) -> Result<(), String> {
+    if had_previous {
+        rollback_profile(nix_bin)?;
+        rollback_profile(nix_bin)?;
+        let binary = synapse_profile()?.join("bin").join(name);
+        if !is_executable(&binary) {
+            return Err(format!(
+                "profile rollback did not restore executable {}",
+                binary.display()
+            ));
+        }
+        Ok(())
+    } else {
+        remove_profile_package(nix_bin, name)
+    }
+}
+
+pub fn undo_profile_remove(nix_bin: &str, name: &str) -> Result<(), String> {
+    rollback_profile(nix_bin)?;
+    let binary = synapse_profile()?.join("bin").join(name);
+    if is_executable(&binary) {
+        Ok(())
+    } else {
+        Err(format!(
+            "profile rollback did not restore executable {}",
+            binary.display()
+        ))
+    }
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn build_package(
     nix_attr: &str,
     flake_dir: &std::path::Path,
     nix_bin: &str,
-) -> Result<String, String> {
-    let status = Command::new(nix_bin)
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            &format!(".#{nix_attr}"),
-            "--no-write-lock-file",
-        ])
-        .current_dir(flake_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("spawn nix: {e}"))?;
-
-    if !status.success() {
-        return Err(format!("nix build exited {}", status.code().unwrap_or(-1)));
-    }
-
-    // Read new version.
+) -> Result<(String, bool), String> {
+    let attr = flake_attr(flake_dir, nix_attr);
+    let version_attr = flake_attr(flake_dir, &format!("{nix_attr}.version"));
     let out = Command::new(nix_bin)
         .args([
             "--extra-experimental-features",
             "nix-command flakes",
+            "--no-accept-flake-config",
             "eval",
             "--raw",
-            &format!(".#{nix_attr}.version"),
+            &version_attr,
             "--no-write-lock-file",
         ])
         .current_dir(flake_dir)
         .output()
         .map_err(|e| format!("nix eval: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "nix eval exited {}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err("nix eval returned an empty package version".to_string());
+    }
 
-    Ok(if out.status.success() {
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    } else {
-        "unknown".into()
-    })
+    let had_previous = replace_profile_package(nix_bin, nix_attr, &attr, flake_dir)?;
+    Ok((version, had_previous))
 }
 
-/// Resolve the Nix store path for a built package.
+/// Resolve the Nix store path for an installed package.
 ///
-/// Recorded in state so `synapse rollback` can re-point at an old closure that
-/// is still in the store instead of rebuilding it. Returns `None` when the path
-/// cannot be resolved — rollback then falls back to a rebuild.
+/// The dedicated profile roots the current path; recording it also lets rollback
+/// select the prior closure directly from state history.
 pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str) -> Option<String> {
+    let attr = flake_attr(flake_dir, nix_attr);
     let out = Command::new(nix_bin)
         .args([
             "--extra-experimental-features",
             "nix-command flakes",
+            "--no-accept-flake-config",
             "path-info",
-            &format!(".#{nix_attr}"),
+            &attr,
             "--no-write-lock-file",
         ])
         .current_dir(flake_dir)
@@ -174,19 +360,11 @@ pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str)
         .map(str::to_string)
 }
 
-/// Locate the directory containing `flake.nix`.
+/// Resolve a working directory for Nix.
 ///
-/// Order matters, and the CWD is deliberately *last*: launchd runs jobs with
-/// `PWD=/`, so a scheduled `auto-update now` that trusted the working directory
-/// would look for the flake in `/`, fail every package build, and report FAILED
-/// while the same command worked perfectly from an interactive shell.
-///
-/// Checked in order:
-/// 1. `SYNAPSE_FLAKE_DIR`, for an explicit override.
-/// 2. Next to the executable (installed layout).
-/// 3. Walking up from the executable, covering `target/release/synapse` in a
-///    dev checkout and `<prefix>/bin/synapse` beside a shared flake.
-/// 4. The current directory, last, for `cargo run` from the repo root.
+/// A local flake is trusted only through the explicit `SYNAPSE_FLAKE_DIR`
+/// development override. Otherwise package attributes always come from the
+/// public Synapse flake, regardless of the executable's ancestors or CWD.
 pub fn locate_flake_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("SYNAPSE_FLAKE_DIR") {
         let path = std::path::PathBuf::from(dir);
@@ -194,29 +372,6 @@ pub fn locate_flake_dir() -> std::path::PathBuf {
             return path;
         }
     }
-
-    if let Ok(exe) = std::env::current_exe() {
-        // Walk up from the binary; bounded so a deep path cannot spin.
-        let mut cursor = exe.parent();
-        for _ in 0..5 {
-            let Some(dir) = cursor else { break };
-            if dir.join("flake.nix").is_file() {
-                return dir.to_path_buf();
-            }
-            cursor = dir.parent();
-        }
-    }
-
-    // Only trust the CWD if it actually holds a flake, so a scheduled run from
-    // `/` does not silently proceed with a directory that cannot possibly work.
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("flake.nix").is_file() {
-            return cwd;
-        }
-    }
-
-    // Nothing found. Return the CWD so the caller's `nix build` fails with a
-    // real message rather than us inventing a path that does not exist.
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
@@ -295,26 +450,180 @@ mod tests {
         std::fs::remove_dir_all(&empty).ok();
     }
 
-    /// In this checkout the binary lives at `target/{debug,release}/synapse`, so
-    /// walking up from the executable must find the repo's own flake without any
-    /// reliance on the current directory.
     #[test]
-    fn locates_flake_by_walking_up_from_the_executable() {
+    fn implicit_checkout_flake_is_not_trusted() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_dir = std::env::var_os("SYNAPSE_FLAKE_DIR");
+        let previous_ref = std::env::var_os("SYNAPSE_FLAKE_REF");
+        std::env::remove_var("SYNAPSE_FLAKE_DIR");
+        std::env::set_var("SYNAPSE_FLAKE_REF", "github:example/synapse");
+        let attr = flake_attr(&locate_flake_dir(), "omp");
+        match previous_dir {
+            Some(value) => std::env::set_var("SYNAPSE_FLAKE_DIR", value),
+            None => std::env::remove_var("SYNAPSE_FLAKE_DIR"),
+        }
+        match previous_ref {
+            Some(value) => std::env::set_var("SYNAPSE_FLAKE_REF", value),
+            None => std::env::remove_var("SYNAPSE_FLAKE_REF"),
+        }
+        assert_eq!(attr, "github:example/synapse#omp");
+    }
+
+    #[test]
+    fn flake_attr_uses_explicit_local_flake() {
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!("synapse-local-flake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("flake.nix"), "{}").unwrap();
+        let previous = std::env::var_os("SYNAPSE_FLAKE_DIR");
+        std::env::set_var("SYNAPSE_FLAKE_DIR", &dir);
+        assert_eq!(flake_attr(&dir, "omp"), ".#omp");
+        match previous {
+            Some(value) => std::env::set_var("SYNAPSE_FLAKE_DIR", value),
+            None => std::env::remove_var("SYNAPSE_FLAKE_DIR"),
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn flake_attr_uses_remote_when_no_local_flake_exists() {
         let _guard = crate::test_utils::XDG_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("SYNAPSE_FLAKE_REF");
+        std::env::set_var("SYNAPSE_FLAKE_REF", "github:example/synapse");
+        let attr = flake_attr(std::path::Path::new("/"), "omp");
+        match previous {
+            Some(value) => std::env::set_var("SYNAPSE_FLAKE_REF", value),
+            None => std::env::remove_var("SYNAPSE_FLAKE_REF"),
+        }
+        assert_eq!(attr, "github:example/synapse#omp");
+    }
 
-        let prev = std::env::var_os("SYNAPSE_FLAKE_DIR");
-        std::env::remove_var("SYNAPSE_FLAKE_DIR");
-        let found = locate_flake_dir();
-        if let Some(v) = prev {
-            std::env::set_var("SYNAPSE_FLAKE_DIR", v);
+    #[cfg(unix)]
+    #[test]
+    fn package_install_uses_remote_flake_and_roots_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("synapse-remote-flake-{}", std::process::id()));
+        let fake_nix = dir.join("nix");
+        let log = dir.join("nix.log");
+        let profile = dir.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &fake_nix,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$SYNAPSE_NIX_TEST_LOG\"\n\
+             case \" $* \" in\n\
+               *' profile add '*)\n\
+                 mkdir -p \"$SYNAPSE_PROFILE/bin\"\n\
+                 printf '#!/bin/sh\\n' > \"$SYNAPSE_PROFILE/bin/omp\"\n\
+                 chmod 755 \"$SYNAPSE_PROFILE/bin/omp\"\n\
+                 ;;\n\
+               *' eval '*) printf '18.0.4' ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let previous_ref = std::env::var_os("SYNAPSE_FLAKE_REF");
+        let previous_log = std::env::var_os("SYNAPSE_NIX_TEST_LOG");
+        let previous_profile = std::env::var_os("SYNAPSE_PROFILE");
+        std::env::set_var("SYNAPSE_FLAKE_REF", "github:example/synapse");
+        std::env::set_var("SYNAPSE_NIX_TEST_LOG", &log);
+        std::env::set_var("SYNAPSE_PROFILE", &profile);
+
+        assert_eq!(
+            build_package("omp", &dir, fake_nix.to_str().unwrap())
+                .unwrap()
+                .0,
+            "18.0.4"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+
+        match previous_ref {
+            Some(value) => std::env::set_var("SYNAPSE_FLAKE_REF", value),
+            None => std::env::remove_var("SYNAPSE_FLAKE_REF"),
+        }
+        match previous_log {
+            Some(value) => std::env::set_var("SYNAPSE_NIX_TEST_LOG", value),
+            None => std::env::remove_var("SYNAPSE_NIX_TEST_LOG"),
+        }
+        match previous_profile {
+            Some(value) => std::env::set_var("SYNAPSE_PROFILE", value),
+            None => std::env::remove_var("SYNAPSE_PROFILE"),
         }
 
-        assert!(
-            found.join("flake.nix").is_file(),
-            "resolved {found:?}, which has no flake.nix — a scheduled run from / \
-             would fail every package build"
-        );
+        assert!(calls.contains("profile remove"));
+        assert!(calls.contains("profile add"));
+        assert!(calls.contains("github:example/synapse#omp"));
+        assert!(!calls.contains(" build "));
+        assert!(profile.join("bin/omp").is_file());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_failure_is_nonzero_and_preserves_state_and_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::test_utils::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("synapse-update-failure-{}", std::process::id()));
+        let fake_nix = dir.join("nix");
+        let config = dir.join("config");
+        let profile = dir.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &fake_nix,
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then\n\
+               echo 'nix (Nix) 2.34.0'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_profile = std::env::var_os("SYNAPSE_PROFILE");
+        std::env::set_var("PATH", &dir);
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("SYNAPSE_PROFILE", &profile);
+
+        let cfg = state::config_dir();
+        let mut before = state::State::default();
+        before.set_package_with_path("herdr", "0.7.4", Some("/nix/store/old-herdr".into()));
+        state::write(&cfg, &before).unwrap();
+        let error = run(Some("herdr"), false).unwrap_err();
+        let after = state::read(&cfg).unwrap();
+
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match previous_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match previous_profile {
+            Some(value) => std::env::set_var("SYNAPSE_PROFILE", value),
+            None => std::env::remove_var("SYNAPSE_PROFILE"),
+        }
+
+        assert!(error.to_string().contains("package update failed"));
+        assert_eq!(after, before);
+        assert!(!profile.exists());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

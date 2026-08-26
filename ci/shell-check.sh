@@ -47,6 +47,8 @@ run_setup
 echo "== $SHELL_NAME: second run (idempotency)"
 second_output="$(run_setup)"
 
+# Assertion commands deliberately return non-zero before `check` records them.
+set +e
 # --- rc file is valid syntax for this shell --------------------------------
 "$SHELL_NAME" -n "$RC" >/dev/null 2>&1
 check "rc parses as valid $SHELL_NAME" $?
@@ -65,7 +67,9 @@ printf '%s' "$second_output" | grep -q 'already configured'
 check "second run reported 'already configured'" $?
 
 # --- no temp file left behind ---------------------------------------------
-! ls "$FAKE"/.*synapse-tmp >/dev/null 2>&1
+ls "$FAKE"/.*synapse-tmp >/dev/null 2>&1
+tmp_status=$?
+[ "$tmp_status" -ne 0 ]
 check "no .synapse-tmp left behind" $?
 
 # --- completions were generated where the rc expects them ------------------
@@ -77,11 +81,14 @@ esac
 [ -r "$COMP" ]
 check "completion script exists at $COMP" $?
 
+grep -q '.local/share/synapse/profile/bin' "$RC"
+check "managed profile PATH is configured" $?
+
 # --- shell-specific behaviour ---------------------------------------------
 case "$SHELL_NAME" in
   bash)
     # PATH must gain the profile exactly once, even after sourcing twice.
-    count="$(HOME="$FAKE" bash -c '
+    count="$(HOME="$FAKE" PATH=/usr/bin:/bin bash -c '
       source "$HOME/.bashrc" >/dev/null 2>&1
       source "$HOME/.bashrc" >/dev/null 2>&1
       printf "%s" "$PATH" | tr ":" "\n" | grep -c "nix-profile/bin"

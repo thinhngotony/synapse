@@ -7,11 +7,11 @@
 //!      stderr for `nix-fast-build`-style progress lines.
 //!   4. Show a per-package progress bar with ETA.
 //!   5. On completion, run a `synapse doctor` stub to verify installed binaries.
-//!   6. On Ctrl+C at any point, print a message and exit cleanly; partial Nix
-//!      store entries are GC'd by Nix on the next collect run.
+//!   6. Ctrl+C exits while selecting; an in-flight profile transaction runs to
+//!      completion so the UI never reports an abort while Nix is still mutating.
 
 use std::io;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -201,7 +201,11 @@ fn draw_header(f: &mut Frame, state: &InstallerState, area: ratatui::layout::Rec
             Span::styled(nix_str, nix_style),
         ]),
         Line::from(Span::styled(
-            "Synapse v1.0 — AI harness installer",
+            concat!(
+                "Synapse v",
+                env!("CARGO_PKG_VERSION"),
+                " — AI harness installer"
+            ),
             Style::default().add_modifier(Modifier::BOLD),
         )),
     ];
@@ -306,9 +310,7 @@ fn draw_progress(f: &mut Frame, state: &InstallerState, area: ratatui::layout::R
 fn draw_footer(f: &mut Frame, state: &InstallerState, area: ratatui::layout::Rect) {
     let text = match state.step {
         Step::Select => "↑/↓ move  Space toggle  Enter install  q quit  Ctrl+C abort",
-        Step::Installing => {
-            "Installing… Ctrl+C to abort (partial installs cleaned up by nix-collect-garbage)"
-        }
+        Step::Installing => "Installing… waiting for the current profile transaction",
         Step::Done => "Installation complete. Press q to exit.",
     };
     let para = Paragraph::new(text)
@@ -318,57 +320,47 @@ fn draw_footer(f: &mut Frame, state: &InstallerState, area: ratatui::layout::Rec
 }
 
 // ── Install logic ─────────────────────────────────────────────────────────────
+type InstallResult = Result<(String, Option<String>, bool), String>;
 
-/// Install a single package via `nix build .#<attr>` and update `state.json`.
+/// Install a single package from the resolved local or remote flake and update `state.json`.
 ///
-/// Progress callback is called with elapsed seconds so the TUI can update the
-/// gauge. Returns the installed version on success (read from `nix eval`).
-pub fn install_package(
-    pkg: &Package,
-    flake_dir: &std::path::Path,
-    nix_bin: &str,
-) -> Result<String, String> {
-    let mut child: Child = Command::new(nix_bin)
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            &format!(".#{}", pkg.nix_attr),
-            "--no-write-lock-file",
-        ])
-        .current_dir(flake_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn nix: {e}"))?;
+/// Returns the installed version, store path, and whether a prior profile element
+/// was replaced.
+fn install_package(pkg: &Package, flake_dir: &std::path::Path, nix_bin: &str) -> InstallResult {
+    let attr = crate::commands::update::flake_attr(flake_dir, pkg.nix_attr);
 
-    let status = child.wait().map_err(|e| format!("wait nix: {e}"))?;
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        return Err(format!("nix build exited with status {code}"));
-    }
-
-    // Read version via `nix eval .#<attr>.version`
+    let version_attr =
+        crate::commands::update::flake_attr(flake_dir, &format!("{}.version", pkg.nix_attr));
+    // Read version from the same local or remote flake.
     let ver_out = Command::new(nix_bin)
         .args([
             "--extra-experimental-features",
             "nix-command flakes",
+            "--no-accept-flake-config",
             "eval",
             "--raw",
-            &format!(".#{}.version", pkg.nix_attr),
+            &version_attr,
             "--no-write-lock-file",
         ])
         .current_dir(flake_dir)
         .output()
         .map_err(|e| format!("nix eval version: {e}"))?;
 
-    let version = if ver_out.status.success() {
-        String::from_utf8_lossy(&ver_out.stdout).trim().to_string()
-    } else {
-        "unknown".to_string()
-    };
+    if !ver_out.status.success() {
+        return Err(format!(
+            "nix eval version exited with status {}",
+            ver_out.status.code().unwrap_or(-1)
+        ));
+    }
+    let version = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err("nix eval returned an empty package version".to_string());
+    }
+    let had_previous =
+        crate::commands::update::replace_profile_package(nix_bin, pkg.name, &attr, flake_dir)?;
 
-    Ok(version)
+    let store_path = crate::commands::update::store_path_of(pkg.nix_attr, flake_dir, nix_bin);
+    Ok((version, store_path, had_previous))
 }
 
 /// Spawn `install_package` on a worker thread.
@@ -376,11 +368,11 @@ pub fn install_package(
 /// The returned receiver yields exactly one message when the build finishes.
 /// The caller polls it with `try_recv` between renders, so the ratatui event
 /// loop keeps ticking and the progress gauge animates while Nix works.
-pub fn spawn_install(
+fn spawn_install(
     pkg: &'static Package,
     flake_dir: std::path::PathBuf,
     nix_bin: String,
-) -> Receiver<Result<String, String>> {
+) -> Receiver<InstallResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         // Send failure is fine: it only means the TUI stopped listening.
@@ -426,9 +418,9 @@ const _: () = assert!(MIN_HEIGHT > HEADER_ROWS + FOOTER_ROWS);
 
 /// Run the interactive TUI installer.
 ///
-/// Returns once the user exits (`q`, `Ctrl+C`, or after install completes).
-/// The caller is responsible for ensuring `flake_dir` contains a `flake.nix`
-/// and a `nix` binary exists on PATH.
+/// Returns once the user exits (`q`, `Ctrl+C` while selecting, or after completion).
+/// `flake_dir` selects a local development flake when present; installed releases
+/// use the remote flake fallback. A `nix` binary must be available.
 ///
 /// Refuses to start when stdout is not a terminal, or when the terminal is too
 /// small to draw into, and says why. Previously `enable_raw_mode()` was the first
@@ -483,11 +475,7 @@ pub fn run(flake_dir: &std::path::Path) -> io::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(e) = result {
-        eprintln!("TUI error: {e}");
-    }
-
-    Ok(())
+    result
 }
 
 fn event_loop(
@@ -551,8 +539,7 @@ fn event_loop(
 ///
 /// Each package's build runs on a worker thread; this loop polls its channel
 /// on a 200 ms tick and re-renders between polls, so the progress gauge
-/// animates instead of freezing on a blocking `wait()`. Ctrl+C is still read
-/// during the build and aborts the remaining queue.
+/// animates instead of freezing on the profile transaction.
 fn run_installs(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut InstallerState,
@@ -564,13 +551,12 @@ fn run_installs(
     let _lock = match state::acquire(&cfg_dir) {
         Ok(l) => l,
         Err(state::LockError::Held { owner_pid }) => {
-            // Mark all as failed and return to the Done view.
-            let msg = format!("another synapse is running (PID {owner_pid})");
-            for s in app.install_status.iter_mut() {
-                *s = InstallStatus::Failed(msg.clone());
+            let message = format!("another synapse is running (PID {owner_pid})");
+            for status in app.install_status.iter_mut() {
+                *status = InstallStatus::Failed(message.clone());
             }
             app.step = Step::Done;
-            return Ok(());
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
         Err(state::LockError::Io(e)) => {
             return Err(e);
@@ -578,6 +564,7 @@ fn run_installs(
     };
 
     let tick = Duration::from_millis(200);
+    let mut failures = Vec::new();
 
     for (i, pkg) in PACKAGES.iter().enumerate() {
         if !app.selected[i] {
@@ -590,50 +577,46 @@ fn run_installs(
 
         let rx = spawn_install(pkg, flake_dir.to_path_buf(), nix_bin.to_string());
 
-        // Poll for completion while continuing to render and read input.
-        let outcome = loop {
+        // Poll for completion while continuing to render.
+        // Profile replacement is transactional but not cancellable. Wait for the
+        // worker rather than reporting an abort while Nix is still mutating it.
+        let result = loop {
             terminal.draw(|f| draw(f, app))?;
-
             match rx.try_recv() {
-                Ok(result) => break Some(result),
+                Ok(result) => break result,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Worker died without sending — treat as a build failure.
-                    break Some(Err("build thread terminated unexpectedly".to_string()));
+                    break Err("install thread terminated unexpectedly".to_string())
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => thread::sleep(tick),
             }
-
-            // Ctrl+C during a build: stop the queue. The in-flight Nix build is
-            // left to finish or be killed with us; its partial store paths are
-            // unreferenced and removed by `nix-collect-garbage`.
-            if event::poll(tick)? {
-                if let Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }) = event::read()?
-                {
-                    break None;
-                }
-            }
-        };
-
-        let Some(result) = outcome else {
-            // Aborted: leave this package's status as Running-turned-Failed so
-            // the user sees which one was interrupted.
-            app.install_status[i] = InstallStatus::Failed("aborted by user".to_string());
-            app.step = Step::Done;
-            return Ok(());
         };
 
         match result {
-            Ok(version) => {
-                app.install_status[i] = InstallStatus::Done;
-                // Persist to state.json; a write failure must not abort the run.
-                if let Ok(mut st) = state::read(&cfg_dir) {
-                    st.set_package(pkg.name, &version);
-                    let _ = state::write(&cfg_dir, &st);
+            Ok((version, store_path, had_previous)) => {
+                let persisted = state::read(&cfg_dir).and_then(|mut state| {
+                    state.set_package_with_path(pkg.name, &version, store_path);
+                    state::write(&cfg_dir, &state)
+                });
+                if let Err(error) = persisted {
+                    let rollback = crate::commands::update::undo_profile_replace(
+                        nix_bin,
+                        pkg.name,
+                        had_previous,
+                    )
+                    .err();
+                    let message = match rollback {
+                        Some(rollback) => {
+                            format!(
+                                "state write failed: {error}; profile rollback failed: {rollback}"
+                            )
+                        }
+                        None => format!("state write failed: {error}; profile restored"),
+                    };
+                    app.install_status[i] = InstallStatus::Failed(message.clone());
+                    failures.push(format!("{}: {message}", pkg.name));
+                    continue;
                 }
+                app.install_status[i] = InstallStatus::Done;
                 let _ = crate::commands::log::append(&format!(
                     "{} installed {} {}",
                     now_secs(),
@@ -641,8 +624,9 @@ fn run_installs(
                     version
                 ));
             }
-            Err(msg) => {
-                app.install_status[i] = InstallStatus::Failed(msg);
+            Err(message) => {
+                app.install_status[i] = InstallStatus::Failed(message.clone());
+                failures.push(format!("{}: {message}", pkg.name));
             }
         }
 
@@ -658,9 +642,15 @@ fn run_installs(
         .filter(|(i, _)| app.selected[*i] && matches!(app.install_status[*i], InstallStatus::Done))
         .map(|(_, p)| p.name)
         .collect();
-    let _ = doctor_check(&bins); // surfaced by `synapse doctor` (SYN-11)
-
-    Ok(())
+    let _ = doctor_check(&bins);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "package installation failed: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 fn now_secs() -> u64 {

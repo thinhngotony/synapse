@@ -59,6 +59,11 @@ impl Shell {
     pub fn path_snippet(self) -> String {
         match self {
             Shell::Bash | Shell::Zsh => concat!(
+                "# Synapse managed packages\n",
+                "case \":$PATH:\" in\n",
+                "  *\":$HOME/.local/share/synapse/profile/bin:\"*) ;;\n",
+                "  *) PATH=\"$HOME/.local/share/synapse/profile/bin:$PATH\" ;;\n",
+                "esac\n",
                 "# Nix single-user profile\n",
                 "if [ -e \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ]; then\n",
                 "  . \"$HOME/.nix-profile/etc/profile.d/nix.sh\"\n",
@@ -71,6 +76,10 @@ impl Shell {
             )
             .to_string(),
             Shell::Fish => concat!(
+                "# Synapse managed packages\n",
+                "if test -d \"$HOME/.local/share/synapse/profile/bin\"\n",
+                "    fish_add_path --path --prepend \"$HOME/.local/share/synapse/profile/bin\"\n",
+                "end\n",
                 "# Nix single-user profile\n",
                 "if test -d \"$HOME/.nix-profile/bin\"\n",
                 "    fish_add_path --path --prepend \"$HOME/.nix-profile/bin\"\n",

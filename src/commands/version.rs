@@ -43,6 +43,6 @@ mod tests {
 
     #[test]
     fn version_matches_cargo_manifest() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.0");
     }
 }

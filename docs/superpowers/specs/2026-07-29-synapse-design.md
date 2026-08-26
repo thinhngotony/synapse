@@ -1,8 +1,8 @@
 # Synapse — Universal AI Tool Sync
 
-**Status**: Approved (pair-reviewed 2026-07-29, 20 findings resolved; orchestrated review 2026-07-31 — 8 gaps addressed in Phase 6, 9 items deferred to v1.1)
-**Revised**: 2026-07-31 — v1 scope narrowed for tractability
-**Replaces**: skillshare (`~/.config/skillshare/`)
+**Status**: Superseded by the v1.1 portable OMP stack (2026-08-25)
+**Historical decision changed**: Skillshare is retained for skills/agents/extras; Synapse owns
+OMP plugin and MCP portability rather than replacing Skillshare or introducing a second sync engine.
 
 ---
 

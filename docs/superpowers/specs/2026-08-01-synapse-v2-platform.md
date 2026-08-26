@@ -1,8 +1,9 @@
 # Synapse v2.0 — AI Harness Platform
 
-**Status**: Design phase
+**Status**: Rejected historical design
 **Created**: 2026-08-01
-**Supersedes**: v1.0 sync-only spec
+**Rejected**: 2026-08-25 — mmap state, custom delta cloud sync, GPU TUI, and parallel build
+machinery add complexity without measured need. v1.1 keeps JSON, Git, Skillshare, and native OMP.
 
 ---
 

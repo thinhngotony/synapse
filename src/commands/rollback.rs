@@ -1,9 +1,7 @@
 use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::state;
-use crate::tui::PACKAGES;
 
 /// `synapse rollback [package]`
 ///
@@ -55,87 +53,74 @@ pub fn run(package: Option<&str>) -> io::Result<()> {
 
     let _lock = state::acquire(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
     let flake_dir = crate::commands::update::locate_flake_dir();
+    let nix_bin = crate::nix::resolve_bin()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nix not found"))?;
+    let mut failures = Vec::new();
 
-    let mut changed = false;
     for name in &rollable {
-        // Capture the target before mutating state so we can report and verify.
         let target = st
             .packages
             .get(name)
-            .and_then(|r| r.history.first().cloned())
+            .and_then(|record| record.history.first().cloned())
             .expect("rollable implies non-empty history");
 
-        let restored = match &target.store_path {
-            // Old closure still in the store: no rebuild needed.
+        let had_previous = match &target.store_path {
             Some(path) if Path::new(path).exists() => {
-                println!(
-                    "  {name}: reusing existing store path for {}",
-                    target.version
-                );
-                true
+                println!("  {name}: restoring profile path for {}", target.version);
+                match crate::commands::update::replace_profile_package(
+                    &nix_bin, name, path, &flake_dir,
+                ) {
+                    Ok(had_previous) => had_previous,
+                    Err(error) => {
+                        eprintln!("  {name}: rollback failed: {error}");
+                        failures.push(format!("{name}: {error}"));
+                        continue;
+                    }
+                }
             }
-            // Path GC'd or never recorded: rebuild the pinned version.
             _ => {
-                println!(
-                    "  {name}: store path unavailable, rebuilding {}",
+                let message = format!(
+                    "rollback path for {} is unavailable; profile history was removed",
                     target.version
                 );
-                rebuild(name, &flake_dir).unwrap_or_else(|e| {
-                    eprintln!("  {name}: rollback failed: {e}");
-                    false
-                })
+                eprintln!("  {name}: {message}");
+                failures.push(format!("{name}: {message}"));
+                continue;
             }
         };
 
-        if !restored {
-            continue;
-        }
-
-        if let Some((from, to)) = st.rollback_package(name) {
-            println!("  {name}: {from} → {} (rolled back)", to.version);
-            let _ = crate::commands::log::append(&format!(
-                "{} rolled back {name} {from} -> {}",
-                now_secs(),
-                to.version
+        let Some((from, to)) = st.rollback_package(name) else {
+            let _ = crate::commands::update::undo_profile_replace(&nix_bin, name, had_previous);
+            return Err(io::Error::other("rollback state changed unexpectedly"));
+        };
+        if let Err(error) = state::write(&cfg, &st) {
+            let rollback =
+                crate::commands::update::undo_profile_replace(&nix_bin, name, had_previous).err();
+            return Err(io::Error::new(
+                error.kind(),
+                match rollback {
+                    Some(rollback) => {
+                        format!("write state: {error}; profile rollback: {rollback}")
+                    }
+                    None => format!("write state: {error}"),
+                },
             ));
-            changed = true;
         }
+        println!("  {name}: {from} → {} (rolled back)", to.version);
+        let _ = crate::commands::log::append(&format!(
+            "{} rolled back {name} {from} -> {}",
+            now_secs(),
+            to.version
+        ));
     }
 
-    if changed {
-        state::write(&cfg, &st)?;
-    }
-
-    Ok(())
-}
-
-/// Rebuild a package from the flake so its store path exists again.
-fn rebuild(nix_attr: &str, flake_dir: &Path) -> Result<bool, String> {
-    let attr = PACKAGES
-        .iter()
-        .find(|p| p.name == nix_attr)
-        .map(|p| p.nix_attr)
-        .unwrap_or(nix_attr);
-
-    let nix_bin = crate::nix::resolve_bin().ok_or_else(|| "nix not found".to_string())?;
-    let status = Command::new(&nix_bin)
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            &format!(".#{attr}"),
-            "--no-write-lock-file",
-        ])
-        .current_dir(flake_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("spawn nix: {e}"))?;
-
-    if status.success() {
-        Ok(true)
+    if failures.is_empty() {
+        Ok(())
     } else {
-        Err(format!("nix build exited {}", status.code().unwrap_or(-1)))
+        Err(io::Error::other(format!(
+            "package rollback failed: {}",
+            failures.join("; ")
+        )))
     }
 }
 

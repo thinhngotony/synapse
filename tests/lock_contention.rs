@@ -8,6 +8,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Path to the `synapse` binary under test.
 fn synapse_bin() -> PathBuf {
@@ -19,10 +22,7 @@ fn scratch_config() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "synapse-lock-it-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&dir).unwrap();
     dir

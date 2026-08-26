@@ -4,6 +4,7 @@ pub mod list;
 pub mod log;
 pub mod rollback;
 pub mod setup;
+pub mod stack;
 pub mod status;
 pub mod uninstall;
 pub mod update;
