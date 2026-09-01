@@ -866,6 +866,23 @@ fn validate_manifest(manifest: &StackManifest) -> io::Result<()> {
             manifest.version
         )));
     }
+    // Detect duplicate MCP across profiles (common copy-paste error in stack.json).
+    {
+        let mut seen_mcp: BTreeMap<String, String> = BTreeMap::new();
+        for profile in &manifest.omp_profiles {
+            if let Some(mcp) = &profile.mcp {
+                let key = serde_json::to_string(mcp).unwrap_or_default();
+                if let Some(prev) = seen_mcp.get(&key) {
+                    eprintln!(
+                        "warning: profile {:?} has identical MCP to profile {:?} — consider deduping (see examples/stack-optimized.json)",
+                        profile.name, prev
+                    );
+                } else {
+                    seen_mcp.insert(key, profile.name.clone());
+                }
+            }
+        }
+    }
     let mut profile_names = BTreeSet::new();
     for profile in &manifest.omp_profiles {
         if !valid_profile_name(&profile.name) || !profile_names.insert(&profile.name) {
@@ -911,6 +928,31 @@ fn validate_manifest(manifest: &StackManifest) -> io::Result<()> {
                     profile.name
                 )));
             }
+            // Detect literal env placeholder bugs like "JIRA_URL": "JIRA_URL"
+            // which should be "!printenv JIRA_URL" or similar.
+            if let Some(servers) = mcp.get("mcpServers").and_then(Value::as_object) {
+                for (srv, cfg) in servers {
+                    if let Some(env) = cfg.get("env").and_then(Value::as_object) {
+                        for (k, v) in env {
+                            if let Some(s) = v.as_str() {
+                                if s == k && is_env_var_name(s) {
+                                    eprintln!(
+                                        "warning: profile {:?} MCP server {:?} env {:?} is literal \"{}\" — likely should be \"!printenv {}\" or \"!cat ...\"",
+                                        profile.name, srv, k, s, s
+                                    );
+                                }
+                                // Detect SONAR_TOKEN vs SONARQUBE_TOKEN mismatch
+                                if k == "SONARQUBE_TOKEN" && s == "!printenv SONAR_TOKEN" {
+                                    eprintln!(
+                                        "warning: profile {:?} MCP server {:?} SONARQUBE_TOKEN uses SONAR_TOKEN; required_env expects SONARQUBE_TOKEN — mismatch",
+                                        profile.name, srv
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else if !profile.required_env.is_empty() {
             return Err(invalid_data(format!(
                 "profile {:?} has required_env without MCP config",
@@ -950,6 +992,71 @@ fn validate_skillshare_preflight(manifest: &StackManifest) -> io::Result<()> {
 }
 
 fn restore_from(input: &Path, manifest: &StackManifest, force: bool) -> io::Result<()> {
+    // Preflight: ensure required runtimes are present before attempting
+    // plugin installs that would otherwise fail with opaque "No such file".
+    // These checks are skipped in tests (which mock OMP/skillshare).
+    #[cfg(not(test))]
+    {
+        if let crate::nix::NixStatus::Missing = crate::nix::detect() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Nix not found — install Nix via https://install.determinate.systems/nix then run `synapse install` to get OMP/herdr/skillshare",
+            ));
+        }
+        // OMP must be resolvable for plugin restores; otherwise `omp plugin install`
+        // fails with ENOENT. Check explicitly so the error is actionable.
+        let has_which = |bin: &str| {
+            std::process::Command::new("which")
+                .arg(bin)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let omp_bin = std::env::var_os("SYNAPSE_OMP_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| if has_which("omp") { Some(std::path::PathBuf::from("omp")) } else { None })
+            .or_else(|| {
+                // Also check the Nix profile bin
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+                let p = home.join(".local/share/synapse/profile/bin/omp");
+                if p.is_file() { Some(p) } else { None }
+            });
+        let has_omp = omp_bin.is_some() || omp_root().map(|p| p.exists()).unwrap_or(false);
+        if !has_omp {
+            // Check if any profile actually needs OMP (has plugins)
+            let needs_omp = manifest.omp_profiles.iter().any(|p| !p.plugins.is_empty());
+            if needs_omp {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "OMP not found — run `synapse install` to install OMP (requires Nix) before `stack restore`",
+                ));
+            }
+        }
+        // Validate MCP commands are at least present or warn (non-fatal, but helpful)
+        for profile in &manifest.omp_profiles {
+            if let Some(mcp) = &profile.mcp {
+                if let Some(servers) = mcp.get("mcpServers").and_then(|v| v.as_object()) {
+                    for (name, srv) in servers {
+                        if let Some(cmd) = srv.get("command").and_then(|v| v.as_str()) {
+                            // Skip placeholders like "${HOME}" and docker
+                            if cmd.contains("${HOME}") || cmd == "docker" {
+                                continue;
+                            }
+                            let found = has_which(cmd) || std::path::Path::new(cmd).exists();
+                            if !found {
+                                eprintln!(
+                                    "warning: MCP server {:?} command {:?} not found on PATH — install it before using profile {:?}",
+                                    name, cmd, profile.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let omp_root = omp_root()?;
     for profile in &manifest.omp_profiles {
         let root = profile_root(&omp_root, &profile.name);
@@ -1398,6 +1505,14 @@ fn valid_profile_name(name: &str) -> bool {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+}
+
+fn is_env_var_name(s: &str) -> bool {
+    // Env var names are typically UPPER_SNAKE like JIRA_URL, SONARQUBE_TOKEN
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 fn validate_relative_path(path: &Path) -> io::Result<()> {
