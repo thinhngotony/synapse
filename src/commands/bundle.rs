@@ -93,103 +93,63 @@ fn collect_resolved_secrets(manifest: &serde_json::Value) -> BTreeMap<String, St
 }
 
 fn encrypt_file(input: &Path, output: &Path, password: &str) -> io::Result<()> {
-    // Try `age` first (preferred, modern, audited)
-    if Command::new("age").arg("--version").output().is_ok() {
-        let _status = Command::new("age")
-            .args(["--passphrase", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    use std::io::Write;
-                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                }
-                child.wait()
-            });
-        if let Ok(status) = std::process::Command::new("age")
-            .args(["--passphrase", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    use std::io::Write;
-                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                }
-                child.wait()
-            }) {
-                if status.success() {
-                    return Ok(());
-                }
-            }
-    }
-    // Fallback: openssl aes-256-cbc (widely available)
+    // Try openssl first (reliable non-interactive passphrase via stdin)
     if Command::new("openssl").arg("version").output().is_ok() {
-        let status = Command::new("openssl")
+        let mut child = Command::new("openssl")
             .args([
                 "enc", "-aes-256-cbc", "-pbkdf2",
                 "-in", input.to_str().unwrap(),
                 "-out", output.to_str().unwrap(),
-                "-pass", &format!("pass:{password}"),
+                "-pass", "stdin",
             ])
-            .status()?;
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin.write_all(format!("{password}\n").as_bytes())?;
+        }
+        let status = child.wait()?;
         if status.success() {
             return Ok(());
         }
+        return Err(io::Error::other("openssl encryption failed"));
     }
-    // Final fallback: XOR obfuscation (NOT secure, but better than plaintext for demo)
-    // In production, require `age` or `openssl`.
-    eprintln!(
-        "warning: age and openssl not found, using insecure XOR obfuscation — install `age` via `brew install age` for real encryption"
-    );
-    let mut data = fs::read(input)?;
-    let key = password.as_bytes();
-    for (i, b) in data.iter_mut().enumerate() {
-        *b ^= key[i % key.len()];
-    }
-    fs::write(output, data)?;
-    Ok(())
+    // Final fallback: none — we require age or openssl for real encryption
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "encryption requires `age` or `openssl`; install one of them",
+    ))
 }
 
 fn decrypt_file(input: &Path, output: &Path, password: &str) -> io::Result<()> {
-    if Command::new("age").arg("--version").output().is_ok() {
-        let status = Command::new("age")
-            .args(["--decrypt", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    use std::io::Write;
-                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                }
-                child.wait()
-            });
-        if let Ok(status) = status {
-            if status.success() {
-                return Ok(());
-            }
-        }
-    }
     if Command::new("openssl").arg("version").output().is_ok() {
-        let status = Command::new("openssl")
+        let mut child = Command::new("openssl")
             .args([
                 "enc", "-d", "-aes-256-cbc", "-pbkdf2",
                 "-in", input.to_str().unwrap(),
                 "-out", output.to_str().unwrap(),
-                "-pass", &format!("pass:{password}"),
+                "-pass", "stdin",
             ])
-            .status()?;
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin.write_all(format!("{password}\n").as_bytes())?;
+        }
+        let status = child.wait()?;
         if status.success() {
             return Ok(());
         }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wrong password or corrupted bundle",
+        ));
     }
-    // XOR fallback
-    let mut data = fs::read(input)?;
-    let key = password.as_bytes();
-    for (i, b) in data.iter_mut().enumerate() {
-        *b ^= key[i % key.len()];
-    }
-    fs::write(output, data)?;
-    Ok(())
+    // If no openssl, fail with clear error — do NOT silently fall back to XOR
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "decryption requires `openssl`; install it or use a bundle encrypted with available tool",
+    ))
 }
 
 pub fn export(
@@ -500,7 +460,6 @@ fn extract_tar_zst(archive: &Path, dest: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
