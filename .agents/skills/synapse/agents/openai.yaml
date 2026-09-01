@@ -1,0 +1,6 @@
+interface:
+  display_name: "Synapse"
+  short_description: "Repo-specific patterns and workflows for synapse"
+  default_prompt: "Use the synapse repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
