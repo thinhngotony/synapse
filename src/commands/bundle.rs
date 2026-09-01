@@ -9,8 +9,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::{self};
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -91,26 +92,133 @@ fn collect_resolved_secrets(manifest: &serde_json::Value) -> BTreeMap<String, St
     out
 }
 
-pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> io::Result<()> {
+fn encrypt_file(input: &Path, output: &Path, password: &str) -> io::Result<()> {
+    // Try `age` first (preferred, modern, audited)
+    if Command::new("age").arg("--version").output().is_ok() {
+        let _status = Command::new("age")
+            .args(["--passphrase", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    stdin.write_all(format!("{password}\n").as_bytes())?;
+                }
+                child.wait()
+            });
+        if let Ok(status) = std::process::Command::new("age")
+            .args(["--passphrase", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    stdin.write_all(format!("{password}\n").as_bytes())?;
+                }
+                child.wait()
+            }) {
+                if status.success() {
+                    return Ok(());
+                }
+            }
+    }
+    // Fallback: openssl aes-256-cbc (widely available)
+    if Command::new("openssl").arg("version").output().is_ok() {
+        let status = Command::new("openssl")
+            .args([
+                "enc", "-aes-256-cbc", "-pbkdf2",
+                "-in", input.to_str().unwrap(),
+                "-out", output.to_str().unwrap(),
+                "-pass", &format!("pass:{password}"),
+            ])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    // Final fallback: XOR obfuscation (NOT secure, but better than plaintext for demo)
+    // In production, require `age` or `openssl`.
+    eprintln!(
+        "warning: age and openssl not found, using insecure XOR obfuscation — install `age` via `brew install age` for real encryption"
+    );
+    let mut data = fs::read(input)?;
+    let key = password.as_bytes();
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[i % key.len()];
+    }
+    fs::write(output, data)?;
+    Ok(())
+}
+
+fn decrypt_file(input: &Path, output: &Path, password: &str) -> io::Result<()> {
+    if Command::new("age").arg("--version").output().is_ok() {
+        let status = Command::new("age")
+            .args(["--decrypt", "--output", output.to_str().unwrap(), input.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    stdin.write_all(format!("{password}\n").as_bytes())?;
+                }
+                child.wait()
+            });
+        if let Ok(status) = status {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    if Command::new("openssl").arg("version").output().is_ok() {
+        let status = Command::new("openssl")
+            .args([
+                "enc", "-d", "-aes-256-cbc", "-pbkdf2",
+                "-in", input.to_str().unwrap(),
+                "-out", output.to_str().unwrap(),
+                "-pass", &format!("pass:{password}"),
+            ])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    // XOR fallback
+    let mut data = fs::read(input)?;
+    let key = password.as_bytes();
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[i % key.len()];
+    }
+    fs::write(output, data)?;
+    Ok(())
+}
+
+pub fn export(
+    output: Option<&Path>,
+    encrypt: bool,
+    password: Option<&str>,
+) -> io::Result<()> {
+    // 1. Capture current stack to a temp dir (reuses existing capture logic)
     let tmp_base = env::temp_dir().join(format!("synapse-bundle-{}", std::process::id()));
     let stack_dir = tmp_base.join("stack");
     fs::create_dir_all(&stack_dir)?;
 
-    let _ = stack::capture(Some(&stack_dir));
-
-    if !stack_dir.join("stack.json").exists() {
-        let fallback = PathBuf::from("/Users/home/Downloads/stack.json");
-        if fallback.exists() {
-            fs::create_dir_all(&stack_dir)?;
-            fs::copy(&fallback, stack_dir.join("stack.json"))?;
-        } else {
-            fs::write(
-                stack_dir.join("stack.json"),
-                r#"{"version":1,"omp_profiles":[],"skillshare":null}"#,
-            )?;
-        }
+    // Capture stack; if it fails (e.g., OMP not installed), we still continue
+    // with whatever we have, but we should NOT silently fall back to a hardcoded path.
+    let capture_result = stack::capture(Some(&stack_dir));
+    if let Err(e) = capture_result {
+        eprintln!("warning: stack capture failed: {e} — bundle will contain only state.json if available");
     }
 
+    // Ensure we have a stack.json. If capture failed and no stack.json exists,
+    // return an error rather than silently using a hardcoded path.
+    if !stack_dir.join("stack.json").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no stack.json found — run `synapse stack capture` first or provide a stack directory with --output",
+        ));
+    }
+
+    // 2. Collect state.json if exists
     let state_src = crate::state::config_dir().join("state.json");
     if state_src.exists() {
         fs::copy(&state_src, tmp_base.join("state.json"))?;
@@ -121,11 +229,42 @@ pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> 
         .unwrap_or_else(|| default_bundle_path(encrypt));
 
     if encrypt {
+        // Resolve password: use provided, or prompt interactively
+        let pass = if let Some(p) = password {
+            p.to_string()
+        } else {
+            eprint!("Enter bundle password: ");
+            io::stderr().flush()?;
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
+            let p = buf.trim().to_string();
+            if p.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "password cannot be empty"));
+            }
+            // Confirm password
+            eprint!("Confirm password: ");
+            io::stderr().flush()?;
+            let mut buf2 = String::new();
+            io::stdin().read_line(&mut buf2)?;
+            if buf2.trim() != p {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "passwords do not match"));
+            }
+            p
+        };
+
+        // 3. Resolve secrets for the bundle (from current environment)
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(stack_dir.join("stack.json"))?)?;
         let secrets = collect_resolved_secrets(&manifest);
-        let secrets_json = serde_json::to_string_pretty(&secrets).unwrap();
-        fs::write(tmp_base.join("secrets.json"), secrets_json)?;
+        let _secrets_json = serde_json::to_string_pretty(&secrets).unwrap();
+        
+        // Write secrets.json with restrictive permissions (0o600)
+        let secrets_path = tmp_base.join("secrets.json");
+        fs::write(&secrets_path, serde_json::to_string_pretty(&secrets).unwrap())?;
+        // Restrict permissions to owner-only
+        let mut perms = fs::metadata(&secrets_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&secrets_path, perms)?;
 
         let env_snapshot: BTreeMap<String, String> = manifest
             .get("omp_profiles")
@@ -137,7 +276,9 @@ pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> 
                         for item in req {
                             if let Some(name) = item.as_str() {
                                 if let Ok(val) = env::var(name) {
-                                    m.insert(name.to_string(), val);
+                                    if !val.is_empty() {
+                                        m.insert(name.to_string(), val);
+                                    }
                                 }
                             }
                         }
@@ -151,12 +292,12 @@ pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> 
             serde_json::to_string_pretty(&env_snapshot).unwrap(),
         )?;
 
+        // 4. Create tar.zst of the entire bundle directory
         let tar_path = tmp_base.with_extension("tar.zst");
         create_tar_zst(&tmp_base, &tar_path)?;
 
-        // For now, just copy the tar.zst to the bundle path with .age extension
-        // Real encryption would use `age --passphrase` here
-        fs::copy(&tar_path, &bundle_path)?;
+        // 5. Encrypt the tar.zst with the provided password
+        encrypt_file(&tar_path, &bundle_path, &pass)?;
         fs::remove_file(&tar_path).ok();
 
         println!(
@@ -170,6 +311,7 @@ pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> 
                 .unwrap_or(0)
         );
     } else {
+        // Non-encrypted bundle: just tar.zst the stack dir (no secrets)
         create_tar_zst(&stack_dir, &bundle_path)?;
         println!(
             "Bundle (no secrets, externalized) → {} — set required_env on restore",
@@ -185,7 +327,7 @@ pub fn export(output: Option<&Path>, encrypt: bool, _password: Option<&str>) -> 
     Ok(())
 }
 
-pub fn import(input: &Path, _password: Option<&str>) -> io::Result<()> {
+pub fn import(input: &Path, password: Option<&str>) -> io::Result<()> {
     if !input.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -193,15 +335,35 @@ pub fn import(input: &Path, _password: Option<&str>) -> io::Result<()> {
         ));
     }
 
+    let is_encrypted = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "age")
+        .unwrap_or(false)
+        || input.to_string_lossy().ends_with(".age");
+
     let tmp_base = env::temp_dir().join(format!("synapse-import-{}", std::process::id()));
     fs::create_dir_all(&tmp_base)?;
 
-    // Simple: assume input is a tar.zst (or .age which is just tar.zst for now)
-    // In production, decrypt first if .age
-    let tar_path = if input.extension().and_then(|e| e.to_str()) == Some("age") {
-        // For now, .age is just a copy of tar.zst, so copy it
+    // Determine if we need to decrypt
+    let tar_path = if is_encrypted {
+        let pass = if let Some(p) = password {
+            p.to_string()
+        } else {
+            eprint!("Enter bundle password: ");
+            io::stderr().flush()?;
+            let mut buf = String::new();
+            io::stdin().read_line(&mut buf)?;
+            buf.trim().to_string()
+        };
+        if pass.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "password required for encrypted bundle",
+            ));
+        }
         let decrypted = tmp_base.join("bundle.tar.zst");
-        fs::copy(input, &decrypted)?;
+        decrypt_file(input, &decrypted, &pass)?;
         decrypted
     } else {
         input.to_path_buf()
@@ -209,27 +371,10 @@ pub fn import(input: &Path, _password: Option<&str>) -> io::Result<()> {
 
     extract_tar_zst(&tar_path, &tmp_base)?;
 
-    let stack_src = if tmp_base.join("stack").join("stack.json").exists() {
-        tmp_base.join("stack")
-    } else if tmp_base.join("stack.json").exists() {
-        tmp_base.clone()
-    } else {
-        // Search one level deep
-        let mut found = None;
-        if let Ok(entries) = fs::read_dir(&tmp_base) {
-            for entry in entries.flatten() {
-                let p = entry.path().join("stack.json");
-                if p.exists() {
-                    found = Some(entry.path());
-                    break;
-                }
-            }
-        }
-        found.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "bundle has no stack.json")
-        })?
-    };
+    // Find stack.json in the extracted bundle
+    let stack_src = find_stack_dir(&tmp_base)?;
 
+    // If we have secrets.json (encrypted bundle), restore env vars
     let secrets_path = tmp_base.join("secrets.json");
     if secrets_path.exists() {
         let secrets: BTreeMap<String, String> =
@@ -240,8 +385,11 @@ pub fn import(input: &Path, _password: Option<&str>) -> io::Result<()> {
         }
     }
 
-    stack::restore(Some(&stack_src), None, "root", true, false)?;
+    // Restore stack with explicit trust flag (respect --trust gate)
+    // Note: import does not auto-trust; user must pass --trust on CLI if they reviewed the bundle
+    stack::restore(Some(&stack_src), None, "root", false, false)?;
 
+    // Also restore state.json if present
     let state_src = tmp_base.join("state.json");
     if state_src.exists() {
         let dest = crate::state::config_dir().join("state.json");
@@ -253,6 +401,32 @@ pub fn import(input: &Path, _password: Option<&str>) -> io::Result<()> {
     fs::remove_dir_all(&tmp_base).ok();
     println!("Import complete — run `synapse doctor` and `synapse status` to verify");
     Ok(())
+}
+
+fn find_stack_dir(base: &Path) -> io::Result<PathBuf> {
+    // Check common locations
+    let candidates = [
+        base.join("stack"),
+        base.join("stack.json").parent().unwrap_or(base).to_path_buf(),
+    ];
+    for c in candidates {
+        if c.join("stack.json").exists() {
+            return Ok(c);
+        }
+    }
+    // Search recursively (shallow)
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("stack.json");
+            if p.exists() {
+                return Ok(entry.path());
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "bundle has no stack.json",
+    ))
 }
 
 fn create_tar_zst(src: &Path, dest: &Path) -> io::Result<()> {
@@ -282,7 +456,7 @@ fn create_tar_zst(src: &Path, dest: &Path) -> io::Result<()> {
             src.file_name().unwrap().to_str().unwrap(),
         ])
         .status()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tar failed: {e}")))?;
+        .map_err(|e| io::Error::other(format!("tar failed: {e}")))?;
     if !status.success() {
         return Err(io::Error::other("tar failed"));
     }
@@ -314,10 +488,65 @@ fn extract_tar_zst(archive: &Path, dest: &Path) -> io::Result<()> {
             dest.to_str().unwrap(),
         ])
         .status()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tar extract failed: {e}")))?;
+        .map_err(|e| io::Error::other(format!("tar extract failed: {e}")))?;
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::other("tar extract failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_default_bundle_path() {
+        let p = default_bundle_path(true);
+        assert!(p.to_string_lossy().ends_with(".tar.zst.age"));
+        let p = default_bundle_path(false);
+        assert!(p.to_string_lossy().ends_with(".tar.zst"));
+    }
+
+    #[test]
+    fn test_collect_resolved_secrets() {
+        let manifest = serde_json::json!({
+            "omp_profiles": [{
+                "mcp": {
+                    "mcpServers": {
+                        "test": {
+                            "env": {
+                                "TEST_VAR": "!printenv TEST_VAR",
+                                "LITERAL": "LITERAL"
+                            }
+                        }
+                    }
+                },
+                "required_env": ["REQUIRED_VAR"]
+            }]
+        });
+        // Mock env vars
+        unsafe { env::set_var("TEST_VAR", "resolved_value"); }
+        unsafe { env::set_var("REQUIRED_VAR", "required_value"); }
+        let secrets = collect_resolved_secrets(&manifest);
+        assert_eq!(secrets.get("TEST_VAR"), Some(&"resolved_value".to_string()));
+        assert_eq!(secrets.get("REQUIRED_VAR"), Some(&"required_value".to_string()));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_xor() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input.txt");
+        let encrypted = dir.path().join("encrypted.age");
+        let decrypted = dir.path().join("decrypted.txt");
+        let password = "test_password";
+
+        fs::write(&input, b"hello world").unwrap();
+        encrypt_file(&input, &encrypted, password).unwrap();
+        decrypt_file(&encrypted, &decrypted, password).unwrap();
+        assert_eq!(fs::read(&decrypted).unwrap(), b"hello world");
     }
 }
