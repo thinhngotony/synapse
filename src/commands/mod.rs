@@ -1,4 +1,5 @@
 pub mod auto_update;
+pub mod bundle;
 pub mod doctor;
 pub mod list;
 pub mod log;
