@@ -102,7 +102,12 @@ download() { # download <url> <dest>
     # shellcheck disable=SC2086  # PROTO_OPT must word-split into two args
     curl -fsSL $PROTO_OPT "$1" -o "$2"
   else
-    wget -q -O "$2" "$1"
+    # shellcheck disable=SC2086
+    if [ -n "${WGET_OPT:-}" ]; then
+      wget -q $WGET_OPT -O "$2" "$1"
+    else
+      wget -q -O "$2" "$1"
+    fi
   fi
 }
 
@@ -143,13 +148,40 @@ fi
 
 # Remote assets must come over TLS. Plain http is allowed only against
 # localhost, which is how ci/install-check.sh exercises this script.
+# Reject any URL containing userinfo (@ before first / after scheme) to
+# prevent http://127.0.0.1:80@example.com being treated as localhost.
 case "$BASE_URL" in
-  https://*)                              PROTO_OPT="--proto =https" ;;
-  http://127.0.0.1[:/]* | http://127.0.0.1 | http://localhost[:/]* | http://localhost)
-                                          PROTO_OPT="--proto =http" ;;
+  *://*@*/*|*://*@*) die "Refusing to download over an untrusted URL: $BASE_URL" \
+         "URL contains userinfo (@) — refusing for security" \
+         "SYNAPSE_BASE_URL must use https, or http on localhost for testing." ;;
+esac
+case "$BASE_URL" in
+  https://*)                              PROTO_OPT="--proto =https" ; WGET_OPT="--https-only" ;;
+  http://127.0.0.1|http://127.0.0.1:*|http://127.0.0.1/*|http://localhost|http://localhost:*|http://localhost/*)
+                                          PROTO_OPT="--proto =http" ; WGET_OPT="" ;;
   *) die "Refusing to download over an untrusted URL: $BASE_URL" \
          "SYNAPSE_BASE_URL must use https, or http on localhost for testing." ;;
 esac
+# Extra validation for localhost HTTP: ensure host is exactly 127.0.0.1 or localhost
+# with optional numeric port and optional path, no userinfo already rejected.
+if [ "${BASE_URL#http://}" != "$BASE_URL" ]; then
+  _tmp="${BASE_URL#http://}"
+  _host="${_tmp%%/*}"; _host="${_host%%:*}"
+  case "$_host" in
+    127.0.0.1|localhost) ;;
+    *) die "Refusing to download over an untrusted URL: $BASE_URL" \
+           "http:// is only allowed for 127.0.0.1 and localhost" ;;
+  esac
+  # Validate port if present
+  _portpart="${_tmp%%/*}"; _portpart="${_portpart#"${_host}"}"
+  if [ -n "$_portpart" ]; then
+    case "$_portpart" in
+      :[0-9]*|:[0-9]*/*|"") ;;
+      *) die "Refusing to download over an untrusted URL: $BASE_URL" \
+             "Invalid port in localhost URL" ;;
+    esac
+  fi
+fi
 
 # ── Header ──────────────────────────────────────────────────────────────────
 printf "\n"
@@ -187,7 +219,26 @@ CK_LINE="$(grep -- "-${TARGET}\.tar\.gz\$" "$TMP/checksums.txt" | head -n1)" || 
 EXPECTED="$(printf '%s\n' "$CK_LINE" | awk '{print $1}')"
 ASSET="$(printf '%s\n' "$CK_LINE" | awk '{sub(/^\*/, "", $2); print $2}')"
 
-download "${BASE_URL}/${ASSET}" "$TMP/$ASSET" 2>/dev/null || die \
+# ── Validate ASSET is a simple basename, no path traversal
+# Must be exactly synapse-<version>-<target>.tar.gz with no slash, backslash, or ..
+case "$ASSET" in
+  */*|*\\*|*..*) die "SHA-256 mismatch — refusing to install." \
+         "asset    $ASSET" \
+         "Asset name contains path traversal (/, \\, ..)" \
+         "The checksums.txt is malformed or tampered with." ;;
+esac
+# Also enforce exact pattern: synapse-<version>-<target>.tar.gz
+# Version may contain dots, hyphens, etc., but must not contain slashes
+case "$ASSET" in
+  synapse-*-"${TARGET}".tar.gz) ;;
+  *) die "SHA-256 mismatch — refusing to install." \
+         "asset    $ASSET" \
+         "Asset name does not match expected pattern synapse-*-${TARGET}.tar.gz" ;;
+esac
+
+# Download to fixed path to avoid $TMP/$ASSET traversal
+ASSET_TMP="$TMP/asset.tar.gz"
+download "${BASE_URL}/${ASSET}" "$ASSET_TMP" 2>/dev/null || die \
   "Failed to download $ASSET" \
   "From: ${BASE_URL}/${ASSET}"
 ok "$ASSET"
@@ -199,7 +250,7 @@ printf "\n"
 printf "  ${BOLD}Verify${NC}\n"
 printf "\n"
 
-ACTUAL="$(sha256_of "$TMP/$ASSET")"
+ACTUAL="$(sha256_of "$ASSET_TMP")"
 if [ "$ACTUAL" != "$EXPECTED" ]; then
   die "SHA-256 mismatch — refusing to install." \
       "asset    $ASSET" \
@@ -216,7 +267,7 @@ printf "\n"
 printf "  ${BOLD}Install${NC}\n"
 printf "\n"
 
-tar -xzf "$TMP/$ASSET" -C "$TMP" || die "Failed to extract $ASSET"
+tar -xzf "$ASSET_TMP" -C "$TMP" || die "Failed to extract $ASSET"
 [ -f "$TMP/synapse" ] || die \
   "$ASSET does not contain a 'synapse' executable at its root."
 

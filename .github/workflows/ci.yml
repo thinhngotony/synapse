@@ -348,7 +348,7 @@ jobs:
         run: |
           cargo llvm-cov --all-targets --locked \
             --ignore-filename-regex '(tui\.rs|main\.rs|build\.rs)' \
-            --fail-under-lines 60 \
+            --fail-under-lines 80 \
             --summary-only
 
   # ── Installer script ──────────────────────────────────────────────────────
@@ -376,6 +376,9 @@ jobs:
 
       - name: end-to-end install against a fake release
         run: bash ci/install-check.sh
+
+      - name: worker embeds install.sh
+        run: node ci/worker-check.mjs
 
   # ── Single required status check for branch protection ─────────────────────
   ci-passed:

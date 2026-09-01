@@ -367,6 +367,9 @@ pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str)
 /// A local flake is trusted only through the explicit `SYNAPSE_FLAKE_DIR`
 /// development override. Otherwise package attributes always come from the
 /// public Synapse flake, regardless of the executable's ancestors or CWD.
+/// For the installed layout (`~/.local/bin/synapse`) there is no local
+/// `flake.nix` within 5 parents, so we fall back to the current directory and
+/// `flake_attr` will return a remote ref like `github:thinhngotony/synapse#herdr`.
 pub fn locate_flake_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("SYNAPSE_FLAKE_DIR") {
         let path = std::path::PathBuf::from(dir);
@@ -374,7 +377,32 @@ pub fn locate_flake_dir() -> std::path::PathBuf {
             return path;
         }
     }
-    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    // Walk up from the executable — the installed layout has the binary at
+    // ~/.local/bin/synapse with no flake nearby, so this will not find one
+    // and we correctly fall back to remote. In a checkout (target/debug/synapse)
+    // it will find the repo root within 5 parents.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cursor = exe.parent();
+        for _ in 0..5 {
+            if let Some(dir) = cursor {
+                if dir.join("flake.nix").is_file() {
+                    return dir.to_path_buf();
+                }
+                cursor = dir.parent();
+            } else {
+                break;
+            }
+        }
+    }
+    // Fall back to CWD if it contains a flake (dev workflow), otherwise just
+    // return CWD — flake_attr will use remote.
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("flake.nix").is_file() {
+            return cwd;
+        }
+        return cwd;
+    }
+    std::path::PathBuf::from(".")
 }
 
 #[cfg(test)]
