@@ -365,11 +365,11 @@ pub fn store_path_of(nix_attr: &str, flake_dir: &std::path::Path, nix_bin: &str)
 /// Resolve a working directory for Nix.
 ///
 /// A local flake is trusted only through the explicit `SYNAPSE_FLAKE_DIR`
-/// development override. Otherwise package attributes always come from the
-/// public Synapse flake, regardless of the executable's ancestors or CWD.
-/// For the installed layout (`~/.local/bin/synapse`) there is no local
-/// `flake.nix` within 5 parents, so we fall back to the current directory and
-/// `flake_attr` will return a remote ref like `github:thinhngotony/synapse#herdr`.
+/// development override. For development workflows (running from a checkout),
+/// we also walk up from the executable to find a local flake — the installed
+/// layout (`~/.local/bin/synapse`) has no flake nearby, so this correctly
+/// falls back to the remote flake. If no override and no local flake is found,
+/// we return the current directory; `flake_attr` will then use the remote ref.
 pub fn locate_flake_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("SYNAPSE_FLAKE_DIR") {
         let path = std::path::PathBuf::from(dir);
@@ -377,10 +377,9 @@ pub fn locate_flake_dir() -> std::path::PathBuf {
             return path;
         }
     }
-    // Walk up from the executable — the installed layout has the binary at
-    // ~/.local/bin/synapse with no flake nearby, so this will not find one
-    // and we correctly fall back to remote. In a checkout (target/debug/synapse)
-    // it will find the repo root within 5 parents.
+    // Walk up from the executable — in a checkout (target/debug/synapse)
+    // this finds the repo root within 5 parents. The installed layout
+    // (~/.local/bin/synapse) has no flake nearby.
     if let Ok(exe) = std::env::current_exe() {
         let mut cursor = exe.parent();
         for _ in 0..5 {
@@ -394,15 +393,9 @@ pub fn locate_flake_dir() -> std::path::PathBuf {
             }
         }
     }
-    // Fall back to CWD if it contains a flake (dev workflow), otherwise just
-    // return CWD — flake_attr will use remote.
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("flake.nix").is_file() {
-            return cwd;
-        }
-        return cwd;
-    }
-    std::path::PathBuf::from(".")
+    // Fall back to CWD (dev workflow when running from repo root without
+    // SYNAPSE_FLAKE_DIR set). `flake_attr` will use remote if no flake.nix.
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 #[cfg(test)]

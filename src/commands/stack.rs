@@ -994,58 +994,62 @@ fn validate_skillshare_preflight(manifest: &StackManifest) -> io::Result<()> {
 fn restore_from(input: &Path, manifest: &StackManifest, force: bool) -> io::Result<()> {
     // Preflight: ensure required runtimes are present before attempting
     // plugin installs that would otherwise fail with opaque "No such file".
-    if let crate::nix::NixStatus::Missing = crate::nix::detect() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Nix not found — install Nix via https://install.determinate.systems/nix then run `synapse install` to get OMP/herdr/skillshare",
-        ));
-    }
-    // OMP must be resolvable for plugin restores; otherwise `omp plugin install`
-    // fails with ENOENT. Check explicitly so the error is actionable.
-    let has_which = |bin: &str| {
-        std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    let omp_bin = std::env::var_os("SYNAPSE_OMP_BIN")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.exists())
-        .or_else(|| if has_which("omp") { Some(std::path::PathBuf::from("omp")) } else { None })
-        .or_else(|| {
-            // Also check the Nix profile bin
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-            let p = home.join(".local/share/synapse/profile/bin/omp");
-            if p.is_file() { Some(p) } else { None }
-        });
-    let has_omp = omp_bin.is_some() || omp_root().map(|p| p.exists()).unwrap_or(false);
-    if !has_omp {
-        // Check if any profile actually needs OMP (has plugins)
-        let needs_omp = manifest.omp_profiles.iter().any(|p| !p.plugins.is_empty());
-        if needs_omp {
+    // These checks are skipped in tests (which mock OMP/skillshare).
+    #[cfg(not(test))]
+    {
+        if let crate::nix::NixStatus::Missing = crate::nix::detect() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "OMP not found — run `synapse install` to install OMP (requires Nix) before `stack restore`",
+                "Nix not found — install Nix via https://install.determinate.systems/nix then run `synapse install` to get OMP/herdr/skillshare",
             ));
         }
-    }
-    // Validate MCP commands are at least present or warn (non-fatal, but helpful)
-    for profile in &manifest.omp_profiles {
-        if let Some(mcp) = &profile.mcp {
-            if let Some(servers) = mcp.get("mcpServers").and_then(|v| v.as_object()) {
-                for (name, srv) in servers {
-                    if let Some(cmd) = srv.get("command").and_then(|v| v.as_str()) {
-                        // Skip placeholders like "${HOME}" and docker
-                        if cmd.contains("${HOME}") || cmd == "docker" {
-                            continue;
-                        }
-                        let found = has_which(cmd) || std::path::Path::new(cmd).exists();
-                        if !found {
-                            eprintln!(
-                                "warning: MCP server {:?} command {:?} not found on PATH — install it before using profile {:?}",
-                                name, cmd, profile.name
-                            );
+        // OMP must be resolvable for plugin restores; otherwise `omp plugin install`
+        // fails with ENOENT. Check explicitly so the error is actionable.
+        let has_which = |bin: &str| {
+            std::process::Command::new("which")
+                .arg(bin)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let omp_bin = std::env::var_os("SYNAPSE_OMP_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| if has_which("omp") { Some(std::path::PathBuf::from("omp")) } else { None })
+            .or_else(|| {
+                // Also check the Nix profile bin
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+                let p = home.join(".local/share/synapse/profile/bin/omp");
+                if p.is_file() { Some(p) } else { None }
+            });
+        let has_omp = omp_bin.is_some() || omp_root().map(|p| p.exists()).unwrap_or(false);
+        if !has_omp {
+            // Check if any profile actually needs OMP (has plugins)
+            let needs_omp = manifest.omp_profiles.iter().any(|p| !p.plugins.is_empty());
+            if needs_omp {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "OMP not found — run `synapse install` to install OMP (requires Nix) before `stack restore`",
+                ));
+            }
+        }
+        // Validate MCP commands are at least present or warn (non-fatal, but helpful)
+        for profile in &manifest.omp_profiles {
+            if let Some(mcp) = &profile.mcp {
+                if let Some(servers) = mcp.get("mcpServers").and_then(|v| v.as_object()) {
+                    for (name, srv) in servers {
+                        if let Some(cmd) = srv.get("command").and_then(|v| v.as_str()) {
+                            // Skip placeholders like "${HOME}" and docker
+                            if cmd.contains("${HOME}") || cmd == "docker" {
+                                continue;
+                            }
+                            let found = has_which(cmd) || std::path::Path::new(cmd).exists();
+                            if !found {
+                                eprintln!(
+                                    "warning: MCP server {:?} command {:?} not found on PATH — install it before using profile {:?}",
+                                    name, cmd, profile.name
+                                );
+                            }
                         }
                     }
                 }
