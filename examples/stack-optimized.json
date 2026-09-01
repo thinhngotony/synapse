@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "omp_profiles": [
+    {
+      "name": "default",
+      "plugins": [
+        {
+          "name": "@dietrichgebert/ponytail",
+          "source": { "type": "package", "spec": "@dietrichgebert/ponytail@4.8.4" },
+          "enabled": true,
+          "enabled_features": null
+        }
+      ],
+      "mcp": {
+        "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+        "mcpServers": {
+          "github": {
+            "command": "github-mcp-server",
+            "args": ["stdio", "--gh-host", "https://github.com", "--toolsets", "default,actions"],
+            "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "!gh auth token --hostname github.com" },
+            "type": "stdio"
+          },
+          "cisco-github": {
+            "command": "github-mcp-server",
+            "args": ["stdio", "--gh-host", "https://github-hyc.scm.engit.cisco.com", "--toolsets", "default,actions"],
+            "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "!gh auth token --hostname github-hyc.scm.engit.cisco.com" },
+            "type": "stdio"
+          },
+          "cisco-jenkins": {
+            "command": "${HOME}/.local/bin/mcp-jenkins",
+            "args": ["--read-only"],
+            "env": {
+              "jenkins_password": "!cat ${HOME}/.config/jenkins/token",
+              "jenkins_url": "!cat ${HOME}/.config/jenkins/host",
+              "jenkins_username": "!cat ${HOME}/.config/jenkins/user"
+            },
+            "type": "stdio"
+          },
+          "cisco-jira": {
+            "command": "${HOME}/.local/bin/mcp-atlassian",
+            "args": ["--enabled-tools", "jira_get_issue,jira_search,jira_get_all_projects,jira_get_transitions", "--read-only"],
+            "env": {
+              "JIRA_API_TOKEN": "!printenv JIRA_API_TOKEN",
+              "JIRA_URL": "!printenv JIRA_URL",
+              "JIRA_USERNAME": "!printenv JIRA_USERNAME"
+            },
+            "type": "stdio"
+          },
+          "cisco-sonar": {
+            "command": "docker",
+            "args": ["run", "-i", "--init", "--rm", "--pull=never", "-e", "SONARQUBE_TOKEN", "-e", "SONARQUBE_URL", "-e", "SONARQUBE_READ_ONLY", "-e", "SONARQUBE_TOOLSETS", "-e", "SONARQUBE_LOG_TO_FILE_DISABLED", "sonarsource/sonarqube-mcp:1.25.0.3221"],
+            "env": {
+              "SONARQUBE_TOKEN": "!printenv SONARQUBE_TOKEN",
+              "SONARQUBE_URL": "!printenv SONARQUBE_URL",
+              "SONARQUBE_READ_ONLY": "!printenv SONARQUBE_READ_ONLY",
+              "SONARQUBE_TOOLSETS": "!printenv SONARQUBE_TOOLSETS",
+              "SONARQUBE_LOG_TO_FILE_DISABLED": "!printenv SONARQUBE_LOG_TO_FILE_DISABLED"
+            },
+            "type": "stdio"
+          }
+        }
+      },
+      "required_env": ["JIRA_URL","JIRA_USERNAME","SONARQUBE_TOKEN","SONARQUBE_URL","SONARQUBE_READ_ONLY","SONARQUBE_TOOLSETS","SONARQUBE_LOG_TO_FILE_DISABLED"]
+    },
+    {
+      "name": "omp",
+      "plugins": [
+        {
+          "name": "@dietrichgebert/ponytail",
+          "source": { "type": "package", "spec": "@dietrichgebert/ponytail@4.8.4" },
+          "enabled": true,
+          "enabled_features": null
+        }
+      ]
+    }
+  ],
+  "skillshare": { "remote": "git@github.com:thinhngotony/agents.git", "git_root": "root" },
+  "version": 1
+}
